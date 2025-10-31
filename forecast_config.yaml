@@ -1,0 +1,23 @@
+# config/forecast_config.yaml
+collector_url: "http://localhost:8080"
+host: "0.0.0.0"
+port: 8081
+
+# Параметры анализа
+min_arbitrage_spread: 0.02
+max_position_size: 1000
+volatility_threshold: 5.0
+confidence_threshold: 0.7
+
+# Производительность
+update_interval: 5
+max_retries: 3
+retry_delay: 5
+
+# Лимиты ресурсов
+max_connections: 10
+max_connections_per_host: 5
+request_timeout: 30
+max_history_size: 1000
+data_cleanup_interval: 3600
+max_historical_points: 500
