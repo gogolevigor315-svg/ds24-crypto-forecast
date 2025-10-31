@@ -69,16 +69,16 @@ def load_config(path: str = "forecast_config.yaml") -> Dict:
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             y = yaml.safe_load(f) or {}
-        # глубокое обновление
+
         def deep_update(d, u):
             for k, v in u.items():
                 if isinstance(v, dict) and isinstance(d.get(k), dict):
                     deep_update(d[k], v)
                 else:
                     d[k] = v
+
         deep_update(cfg, y)
 
-    # ENV overrides (необязательно)
     cfg["collector"]["url"] = os.getenv("FORECAST_COLLECTOR_URL", cfg["collector"]["url"])
     return cfg
 
@@ -87,9 +87,7 @@ CFG = load_config()
 logging.basicConfig(level=getattr(logging, CFG.get("logging", {}).get("level", "INFO")))
 log = logging.getLogger("forecast")
 
-# ------------
-# Модели API
-# ------------
+# ------------ Модели ------------
 
 @dataclass
 class Ticker:
@@ -98,7 +96,7 @@ class Ticker:
     bid: float
     ask: float
     last: float
-    ts: float  # seconds epoch
+    ts: float
 
 
 @dataclass
@@ -137,18 +135,12 @@ class Health(BaseModel):
     timestamp: str
 
 
-# -----------------------
-# Внутренние структуры
-# -----------------------
+# ----------------------- Внутренние данные -----------------------
 
-# История цен last по символу
 HISTORY: Dict[str, Deque[Tuple[float, float]]] = defaultdict(lambda: deque(maxlen=CFG["features"]["history_limit"]))
 LAST_PULL_TS: Optional[float] = None
 
-
-# -----------------------
-# Вспомогательные функции
-# -----------------------
+# ----------------------- Вспомогательные функции -----------------------
 
 def now_ts() -> float:
     return time.time()
@@ -171,8 +163,7 @@ def ema(series: List[float], period: int) -> float:
 def rsi(series: List[float], period: int = 14) -> float:
     if len(series) < period + 1:
         return float("nan")
-    gains = []
-    losses = []
+    gains, losses = [], []
     for i in range(1, period + 1):
         diff = series[-i] - series[-i - 1]
         gains.append(max(0, diff))
@@ -190,7 +181,7 @@ def volatility(series: List[float], window: int) -> float:
         return float("nan")
     sub = np.array(series[-window:])
     rets = np.diff(sub) / sub[:-1]
-    return float(np.std(rets) * 100)  # %
+    return float(np.std(rets) * 100)
 
 
 def momentum(series: List[float], window: int = 10) -> float:
@@ -199,21 +190,9 @@ def momentum(series: List[float], window: int = 10) -> float:
     return float((series[-1] - series[-window]) / series[-window])
 
 
-# -----------------------
-# Клиент коллектора
-# -----------------------
+# ----------------------- Клиент коллектора -----------------------
 
 async def pull_prices() -> List[Ticker]:
-    """Тянем данные из Collector /prices. Ожидаемый формат элемента:
-    {
-      "symbol": "BTCUSDT",
-      "exchange": "binance",
-      "bid": 68000.1,
-      "ask": 68000.3,
-      "last": 68000.2,
-      "timestamp": 1699999999.123  # сек (или мс; ниже нормализуем)
-    }
-    """
     url = CFG["collector"]["url"]
     timeout = CFG["collector"]["timeout_sec"]
     retries = 2
@@ -229,7 +208,6 @@ async def pull_prices() -> List[Ticker]:
                 items = []
                 for v in payload.values() if isinstance(payload, dict) else payload:
                     ts_raw = v.get("timestamp", now_ts())
-                    # нормализация (мс → сек, если нужно)
                     ts_s = float(ts_raw) / (1000.0 if float(ts_raw) > 10**12 else 1.0)
                     items.append(
                         Ticker(
@@ -248,26 +226,21 @@ async def pull_prices() -> List[Ticker]:
                 await asyncio.sleep(delay)
             else:
                 log.warning(f"Collector request failed: {e}")
-    raise HTTPException(status_code=502, detail=f"Collector unavailable: {last_exc}")
+                raise HTTPException(status_code=502, detail=f"Collector unavailable: {last_exc}")
 
 
-# -----------------------
-# Обновление истории
-# -----------------------
+# ----------------------- Обновление истории -----------------------
 
 def update_history(tickers: List[Ticker]) -> None:
     global LAST_PULL_TS
     LAST_PULL_TS = now_ts()
 
-    # TTL-фильтр по max_delay_sec
     max_age = CFG["health"]["max_delay_sec"]
-
     by_symbol: Dict[str, List[Ticker]] = defaultdict(list)
     for t in tickers:
         if (now_ts() - t.ts) <= max_age:
             by_symbol[t.symbol].append(t)
 
-    # средний last по биржам в моменте
     for sym, arr in by_symbol.items():
         if not arr:
             continue
@@ -275,12 +248,9 @@ def update_history(tickers: List[Ticker]) -> None:
         HISTORY[sym].append((t.ts, last_mid))
 
 
-# -----------------------
-# Логика сигналов/прогноза
-# -----------------------
+# ----------------------- Логика -----------------------
 
 def compute_forecast(symbol: str, tickers: List[Ticker]) -> Optional[ForecastResult]:
-    """Возвращает прогноз по символу или None, если данных недостаточно."""
     if symbol not in HISTORY or len(HISTORY[symbol]) < CFG["features"]["min_data_points"]:
         return None
 
@@ -291,7 +261,6 @@ def compute_forecast(symbol: str, tickers: List[Ticker]) -> Optional[ForecastRes
     vol = volatility(series, CFG["features"]["volatility_window"])
     mom = momentum(series, 10)
 
-    # направление
     direction = "neutral"
     if not math.isnan(ema_fast) and not math.isnan(ema_slow):
         if ema_fast > ema_slow * (1 + CFG["signals"]["momentum_threshold"]):
@@ -299,35 +268,25 @@ def compute_forecast(symbol: str, tickers: List[Ticker]) -> Optional[ForecastRes
         elif ema_fast < ema_slow * (1 - CFG["signals"]["momentum_threshold"]):
             direction = "bearish"
 
-    # консенсус по источникам (реальные биржи)
-    exgs = {t.exchange for t in tickers if t.symbol == symbol}
-    total = max(1, len(exgs))  # защита от деления на ноль
-
-    # доверие
-    parts = []
-    parts.append(min(1.0, len(HISTORY[symbol]) / CFG["features"]["history_limit"]))
-    if not math.isnan(vol):
-        parts.append(max(0.1, 1.0 - (vol / 20.0)))
-    parts.append(min(1.0, total / max(1, len(CFG["markets"]["exchanges"]))))
-    confidence = float(np.mean(parts)) if parts else 0.0
+    confidence = float(np.mean([
+        min(1.0, len(HISTORY[symbol]) / CFG["features"]["history_limit"]),
+        max(0.1, 1.0 - (vol / 20.0)) if not math.isnan(vol) else 0.5
+    ]))
 
     return ForecastResult(
         symbol=symbol,
         direction=direction,
         confidence=round(confidence, 3),
-        ema_fast=round(ema_fast, 6) if not math.isnan(ema_fast) else float("nan"),
-        ema_slow=round(ema_slow, 6) if not math.isnan(ema_slow) else float("nan"),
-        rsi=round(rsi_v, 3) if not math.isnan(rsi_v) else float("nan"),
-        volatility=round(vol, 3) if not math.isnan(vol) else float("nan"),
-        momentum=round(mom, 6) if not math.isnan(mom) else float("nan"),
+        ema_fast=round(ema_fast, 6),
+        ema_slow=round(ema_slow, 6),
+        rsi=round(rsi_v, 3),
+        volatility=round(vol, 3),
+        momentum=round(mom, 6),
         timestamp=ts_iso(),
     )
 
 
-def find_arbitrage(
-    symbol: str, tickers: List[Ticker], min_bps: Optional[float] = None
-) -> List[ArbitrageDeal]:
-    """Ищем связки buy/sell по ask/bid с учётом комиссий (bps)."""
+def find_arbitrage(symbol: str, tickers: List[Ticker], min_bps: Optional[float] = None) -> List[ArbitrageDeal]:
     fees = CFG["arbitrage"]["fees_bps_per_exchange"]
     min_bps = float(min_bps) if min_bps is not None else float(CFG["arbitrage"]["min_spread_bps"])
 
@@ -339,14 +298,10 @@ def find_arbitrage(
         for j in range(len(exgs)):
             if i == j:
                 continue
-            b_exg = exgs[i]  # buy на ask
-            s_exg = exgs[j]  # sell по bid
-            buy_t = by_exg[b_exg]
-            sell_t = by_exg[s_exg]
+            b_exg, s_exg = exgs[i], exgs[j]
+            buy_t, sell_t = by_exg[b_exg], by_exg[s_exg]
 
-            buy_ask = buy_t.ask
-            sell_bid = sell_t.bid
-
+            buy_ask, sell_bid = buy_t.ask, sell_t.bid
             if buy_ask <= 0 or sell_bid <= 0:
                 continue
 
@@ -370,14 +325,11 @@ def find_arbitrage(
                     )
                 )
 
-    # Сортировка по чистому спрэду
     deals.sort(key=lambda d: d.net_spread_bps, reverse=True)
     return deals
 
 
-# ------------
-# FastAPI app
-# ------------
+# ------------ FastAPI app ------------
 
 app = FastAPI(title="Forecast Engine", version="1.0")
 
@@ -393,9 +345,7 @@ if CFG.get("misc", {}).get("allow_cors", True):
 @app.get("/health", response_model=Health)
 async def health() -> Health:
     sym_points = {s: len(HISTORY[s]) for s in HISTORY}
-    age = None
-    if LAST_PULL_TS:
-        age = max(0.0, now_ts() - LAST_PULL_TS)
+    age = max(0.0, now_ts() - LAST_PULL_TS) if LAST_PULL_TS else None
     return Health(
         ok=age is not None and age <= CFG["health"]["max_delay_sec"] + 2,
         data_age_sec=age,
@@ -409,8 +359,6 @@ async def health() -> Health:
 @app.get("/forecast")
 async def forecast(symbol: str = Query("BTCUSDT")):
     symbol = symbol.upper()
-
-    # тянем свежие котировки и обновляем историю
     tickers = await pull_prices()
     update_history(tickers)
 
@@ -429,10 +377,7 @@ async def forecast(symbol: str = Query("BTCUSDT")):
 
 
 @app.get("/arbitrage")
-async def arbitrage(
-    symbol: str = Query("BTCUSDT"),
-    min_bps: Optional[float] = Query(None, description="Override min spread threshold (bps)"),
-):
+async def arbitrage(symbol: str = Query("BTCUSDT"), min_bps: Optional[float] = Query(None)):
     symbol = symbol.upper()
     tickers = await pull_prices()
     update_history(tickers)
@@ -444,3 +389,38 @@ async def arbitrage(
         "deals": [asdict(d) for d in deals],
         "timestamp": ts_iso(),
     }
+
+
+# ------------ Dashboard & Root ------------
+
+@app.get("/dashboard")
+async def dashboard():
+    """Публичный дашборд состояния системы"""
+    try:
+        health_data = await health()
+        forecast_data = await forecast(symbol="BTCUSDT")
+        arbitrage_data = await arbitrage(symbol="BTCUSDT", min_bps=2)
+
+        return {
+            "status": "live",
+            "timestamp": datetime.now().isoformat(),
+            "system_health": health_data.dict() if hasattr(health_data, "dict") else health_data,
+            "btc_forecast": forecast_data,
+            "arbitrage_opportunities": len(arbitrage_data.get("deals", [])),
+            "available_endpoints": [
+                "/", "/dashboard", "/health", "/forecast", "/arbitrage"
+            ],
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+@app.get("/")
+async def root():
+    return {
+        "message": "ISKRA DS24 Forecast Engine",
+        "status": "operational",
+        "dashboard": "/dashboard",
+        "health": "/health"
+    }
+ 
