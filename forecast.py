@@ -9,6 +9,9 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+# ⬇️ NEW: импорт роутера адаптера рендера
+from render_adapter import router as render_adapter_router
+
 # ---------------- Конфигурация ----------------
 DEFAULT_CONFIG = {
     "server": {"host": "0.0.0.0", "port": 8081},
@@ -44,14 +47,17 @@ log = logging.getLogger("forecast")
 # ---------------- Модели ----------------
 @dataclass
 class Ticker: symbol:str; exchange:str; bid:float; ask:float; last:float; ts:float
+
 @dataclass
 class ForecastResult:
     symbol:str; direction:str; confidence:float; ema_fast:float; ema_slow:float
     rsi:float; volatility:float; momentum:float; timestamp:str
+
 @dataclass
 class ArbitrageDeal:
     symbol:str; buy_exchange:str; sell_exchange:str; buy_ask:float; sell_bid:float
     gross_spread_bps:float; net_spread_bps:float; notional:float; profit_abs:float; timestamp:str
+
 class Health(BaseModel):
     ok: bool; data_age_sec: Optional[float]; symbols: List[str]
     exchanges_seen: int; points_in_history: Dict[str,int]; timestamp:str
@@ -111,7 +117,8 @@ async def pull_prices()->List[Ticker]:
             if attempt<retries: await asyncio.sleep(delay)
             else:
                 log.warning(f"Collector request failed: {e}")
-                raise HTTPException(status_code=502, detail=f"Collector unavailable: {last_exc}")
+                from fastapi import HTTPException as _HE
+                raise _HE(status_code=502, detail=f"Collector unavailable: {last_exc}")
 
 # ---------------- История ----------------
 def update_history(tickers:List[Ticker])->None:
@@ -168,9 +175,12 @@ def find_arbitrage(symbol:str,tickers:List[Ticker],min_bps:Optional[float]=None)
     return deals
 
 # ---------------- FastAPI ----------------
-app=FastAPI(title="Forecast Engine",version="1.1")
+app=FastAPI(title="Forecast Engine",version="1.2")
 if CFG.get("misc",{}).get("allow_cors",True):
     app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_methods=["*"],allow_headers=["*"])
+
+# ⬇️ NEW: подключаем роуты Render-Adapter
+app.include_router(render_adapter_router)
 
 @app.get("/health",response_model=Health)
 async def health()->Health:
@@ -224,9 +234,13 @@ async def dashboard():
             "system_health":health_data.dict() if hasattr(health_data,"dict") else health_data,
             "btc_forecast":forecast_data,
             "arbitrage_opportunities":len(arbitrage_data.get("deals",[])),
-            "available_endpoints":["/","/dashboard","/health","/forecast","/arbitrage","/api/live"]}
-    except Exception as e: return {"status":"error","error":str(e)}
+            "available_endpoints":["/","/dashboard","/health","/forecast","/arbitrage","/api/live",
+                                   "/observe/graph/{job_id}","/observe/graph/trends","/observe/graph/ingest",
+                                   "/observe/graph/ws"]}
+    except Exception as e:
+        return {"status":"error","error":str(e)}
 
 @app.get("/")
 async def root():
-    return {"message":"ISKRA DS24 Forecast Engine","status":"operational","dashboard":"/dashboard","health":"/health","live_api":"/api/live"}
+    return {"message":"ISKRA DS24 Forecast Engine","status":"operational",
+            "dashboard":"/dashboard","health":"/health","live_api":"/api/live"}
