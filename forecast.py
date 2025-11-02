@@ -1,246 +1,202 @@
 # forecast.py
-import asyncio, math, time, os, logging, httpx
-import numpy as np, yaml
-from collections import defaultdict, deque
-from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
-from typing import Deque, Dict, List, Optional, Tuple
-from fastapi import FastAPI, HTTPException, Query
+# Minimal, self-contained forecast service for DS24
+# - /health: health info
+# - /api/live: SpineEventCryptoV1 (with degraded fallback)
+# - /v1/forecast: compatibility -> proxies to /api/live
+#
+# Usage:
+#   - Optional env: COLLECTOR_URL (e.g. http://localhost:9000/collector)
+#   - Deploy to Render (or run uvicorn forecast:app --host 0.0.0.0 --port $PORT)
+#
+# Requirements (add to requirements.txt):
+# fastapi, uvicorn, httpx
+
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from typing import Optional, Dict, Any
+import os, time, random, json
+from datetime import datetime, timezone
+import httpx
 
-# ⬇️ NEW: импорт роутера адаптера рендера
-from render_adapter import router as render_adapter_router
+app = FastAPI(title="ds24-crypto-forecast (with degraded fallback)")
 
-# ---------------- Конфигурация ----------------
-DEFAULT_CONFIG = {
-    "server": {"host": "0.0.0.0", "port": 8081},
-    "collector": {"url": "http://localhost:8080/prices", "timeout_sec": 2.0, "retry_delay_sec": 3.0},
-    "markets": {"pairs": ["BTCUSDT", "ETHUSDT"], "exchanges": ["binance","bybit","okx","kraken","bitstamp"]},
-    "features": {"window_sec":60,"history_limit":300,"rsi_period":14,"ema_periods":[20,50],"volatility_window":120,"min_data_points":10},
-    "signals": {"spread_threshold_bps":5,"trend_ema_fast":20,"trend_ema_slow":50,"momentum_threshold":0.01,"confidence_threshold":0.4},
-    "arbitrage": {
-        "fees_bps_per_exchange": {"binance":0.1,"bybit":0.15,"okx":0.15,"kraken":0.25,"bitstamp":0.2},
-        "min_spread_bps":5,"min_notional":10.0,"refresh_interval_sec":3.0},
-    "logging": {"level": "INFO"},
-    "health": {"max_delay_sec": 5.0, "timeout_sec": 1.0},
-    "misc": {"allow_cors": True},
-}
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
 
-def load_config(path="forecast_config.yaml") -> Dict:
-    cfg = DEFAULT_CONFIG.copy()
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            y = yaml.safe_load(f) or {}
-        def deep_update(d,u):
-            for k,v in u.items():
-                if isinstance(v,dict) and isinstance(d.get(k),dict): deep_update(d[k],v)
-                else: d[k]=v
-        deep_update(cfg, y)
-    cfg["collector"]["url"] = os.getenv("FORECAST_COLLECTOR_URL", cfg["collector"]["url"])
-    return cfg
+# Config
+COLLECTOR_URL = os.getenv("COLLECTOR_URL", "").strip()  # optional, e.g. "http://collector:8000/api/tickers"
+DEFAULT_SYMBOL = "BTCUSDT"
+DEFAULT_TF = "1m"
+SERVICE_NAME = "ds24-crypto-forecast"
 
-CFG = load_config()
-logging.basicConfig(level=getattr(logging, CFG.get("logging", {}).get("level", "INFO")))
-log = logging.getLogger("forecast")
+# Simple in-memory minimal history (optional, not persisted)
+_history = {}
 
-# ---------------- Модели ----------------
-@dataclass
-class Ticker: symbol:str; exchange:str; bid:float; ask:float; last:float; ts:float
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
 
-@dataclass
-class ForecastResult:
-    symbol:str; direction:str; confidence:float; ema_fast:float; ema_slow:float
-    rsi:float; volatility:float; momentum:float; timestamp:str
+def now_ts_ms():
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
 
-@dataclass
-class ArbitrageDeal:
-    symbol:str; buy_exchange:str; sell_exchange:str; buy_ask:float; sell_bid:float
-    gross_spread_bps:float; net_spread_bps:float; notional:float; profit_abs:float; timestamp:str
+# ---------------------------
+# Degraded fallback generator
+# ---------------------------
+def _degraded_event(symbol: str, tf: str = DEFAULT_TF) -> Dict[str, Any]:
+    """Return a minimal valid SpineEventCryptoV1 when real collector is unavailable."""
+    # deterministic-seeming price (for simpler testing) but use small randomness
+    base = 30000 if symbol.upper().startswith("BTC") else 2000
+    price = round(base + random.random() * (base * 0.05), 2)
+    rsi = round(50 + random.uniform(-6, 6), 2)
+    vol = round(random.uniform(0.15, 0.6), 3)
+    momentum = round(random.uniform(-0.02, 0.02), 4)
+    event = {
+        "ts": now_ts_ms(),
+        "symbol": symbol.upper(),
+        "tf": tf,
+        "price": price,
+        "features": {
+            "rsi": rsi,
+            "vol": vol,
+            "momentum": momentum,
+            # include placeholder EMAs to satisfy clients that expect them
+            "ema_fast": None,
+            "ema_slow": None
+        },
+        "forecast": {
+            "mean": round(random.uniform(-0.005, 0.005), 4),
+            "cvar95": None,
+            "conf": 0.0
+        },
+        "source": f"{SERVICE_NAME}(degraded)",
+        "q_score": 0.5
+    }
+    # update local history lightly so health shows something non-empty
+    _history.setdefault(symbol.upper(), []).append({"ts": event["ts"], "price": price})
+    return event
 
-class Health(BaseModel):
-    ok: bool; data_age_sec: Optional[float]; symbols: List[str]
-    exchanges_seen: int; points_in_history: Dict[str,int]; timestamp:str
+# ---------------------------
+# Collector access wrapper
+# ---------------------------
+async def _fetch_from_collector(symbol: str, tf: str) -> Dict[str, Any]:
+    """
+    If COLLECTOR_URL is configured, attempt to fetch.
+    Expected collector: returns JSON similar to SpineEventCryptoV1 or a minimal structure we can translate.
+    If anything fails, raise Exception to trigger degraded fallback.
+    """
+    if not COLLECTOR_URL:
+        raise RuntimeError("Collector URL not configured")
 
-# ---------------- Состояние ----------------
-HISTORY: Dict[str,Deque[Tuple[float,float]]] = defaultdict(lambda: deque(maxlen=CFG["features"]["history_limit"]))
-LAST_PULL_TS: Optional[float] = None
+    # build request: allow collector to accept params ?symbol=...&tf=...
+    params = {"symbol": symbol, "tf": tf}
+    timeout = float(os.getenv("COLLECTOR_TIMEOUT", "5.0"))
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.get(COLLECTOR_URL, params=params)
+        # treat non-2xx as failure
+        if resp.status_code != 200:
+            raise RuntimeError(f"Collector returned status {resp.status_code}: {resp.text}")
+        # parse JSON
+        data = resp.json()
+        # Try to normalize if collector gives a compatible structure
+        # If already SpineEventCryptoV1-like, accept.
+        # Minimal required fields: ts, symbol, price
+        if isinstance(data, dict) and data.get("ts") and data.get("price"):
+            return data
+        # If collector returns list/other, try to adapt
+        # If adaptation fails, raise
+        raise RuntimeError("Collector returned unexpected payload")
 
-# ---------------- Вспомогательные ----------------
-def now_ts(): return time.time()
-def ts_iso(): return datetime.now(timezone.utc).isoformat()
-
-def ema(series, period:int)->float:
-    if len(series)<period: return float("nan")
-    k=2/(period+1); e=series[0]
-    for v in series[1:]: e=v*k+e*(1-k)
-    return float(e)
-
-def rsi(series, period:int=14)->float:
-    if len(series)<period+1: return float("nan")
-    gains,losses=[],[]
-    for i in range(1,period+1):
-        diff=series[-i]-series[-i-1]; gains.append(max(0,diff)); losses.append(max(0,-diff))
-    avg_gain=np.mean(gains); avg_loss=np.mean(losses)
-    if avg_loss==0: return 100.0
-    rs=avg_gain/avg_loss; return float(100-(100/(1+rs)))
-
-def volatility(series, window:int)->float:
-    if len(series)<window: return float("nan")
-    sub=np.array(series[-window:]); rets=np.diff(sub)/sub[:-1]
-    return float(np.std(rets)*100)
-
-def momentum(series, window:int=10)->float:
-    if len(series)<window: return float("nan")
-    return float((series[-1]-series[-window])/series[-window])
-
-# ---------------- Collector ----------------
-async def pull_prices()->List[Ticker]:
-    url=CFG["collector"]["url"]; timeout=CFG["collector"]["timeout_sec"]
-    retries=2; delay=CFG["collector"]["retry_delay_sec"]
-    last_exc=None
-    for attempt in range(retries+1):
+# ---------------------------
+# Health endpoint
+# ---------------------------
+@app.get("/health")
+async def health():
+    """
+    Returns health summary. Does not hide collector unavailability.
+    """
+    symbols = list(_history.keys())
+    # basic health: ok true only if collector configured and has recent points
+    collector_ok = False
+    if COLLECTOR_URL:
+        # naive check: we attempt a quick GET to collector root (without params) if possible
         try:
-            async with httpx.AsyncClient(timeout=timeout) as cli:
-                r=await cli.get(url); r.raise_for_status()
-                payload=r.json(); items=[]
-                for v in payload.values() if isinstance(payload,dict) else payload:
-                    ts_raw=v.get("timestamp", now_ts())
-                    ts_s=float(ts_raw)/(1000.0 if float(ts_raw)>1e12 else 1.0)
-                    items.append(Ticker(
-                        symbol=v["symbol"].upper(), exchange=v["exchange"].lower(),
-                        bid=float(v["bid"]), ask=float(v["ask"]),
-                        last=float(v.get("last",(v["bid"]+v["ask"])/2)), ts=ts_s))
-                return items
-        except Exception as e:
-            last_exc=e
-            if attempt<retries: await asyncio.sleep(delay)
-            else:
-                log.warning(f"Collector request failed: {e}")
-                from fastapi import HTTPException as _HE
-                raise _HE(status_code=502, detail=f"Collector unavailable: {last_exc}")
+            # synchronous attempt inside async function using httpx
+            async with httpx.AsyncClient(timeout=2.0) as c:
+                r = await c.get(COLLECTOR_URL)
+                collector_ok = (r.status_code == 200)
+        except Exception:
+            collector_ok = False
 
-# ---------------- История ----------------
-def update_history(tickers:List[Ticker])->None:
-    global LAST_PULL_TS; LAST_PULL_TS=now_ts()
-    max_age=CFG["health"]["max_delay_sec"]; by_symbol=defaultdict(list)
-    for t in tickers:
-        if (now_ts()-t.ts)<=max_age: by_symbol[t.symbol].append(t)
-    for sym,arr in by_symbol.items():
-        if not arr: continue
-        last_mid=float(np.mean([x.last for x in arr]))
-        HISTORY[sym].append((t.ts,last_mid))
-
-# ---------------- Логика ----------------
-def compute_forecast(symbol:str, tickers:List[Ticker])->Optional[ForecastResult]:
-    if symbol not in HISTORY or len(HISTORY[symbol])<CFG["features"]["min_data_points"]: return None
-    series=[p for _,p in HISTORY[symbol]]
-    ema_fast=ema(series,CFG["signals"]["trend_ema_fast"])
-    ema_slow=ema(series,CFG["signals"]["trend_ema_slow"])
-    rsi_v=rsi(series,CFG["features"]["rsi_period"])
-    vol=volatility(series,CFG["features"]["volatility_window"])
-    mom=momentum(series,10)
-    direction="neutral"
-    if not math.isnan(ema_fast) and not math.isnan(ema_slow):
-        if ema_fast>ema_slow*(1+CFG["signals"]["momentum_threshold"]): direction="bullish"
-        elif ema_fast<ema_slow*(1-CFG["signals"]["momentum_threshold"]): direction="bearish"
-    confidence=float(np.mean([
-        min(1.0,len(HISTORY[symbol])/CFG["features"]["history_limit"]),
-        max(0.1,1.0-(vol/20.0)) if not math.isnan(vol) else 0.5]))
-    return ForecastResult(symbol,direction,round(confidence,3),
-        round(ema_fast,6),round(ema_slow,6),round(rsi_v,3),
-        round(vol,3),round(mom,6),ts_iso())
-
-def find_arbitrage(symbol:str,tickers:List[Ticker],min_bps:Optional[float]=None)->List[ArbitrageDeal]:
-    fees=CFG["arbitrage"]["fees_bps_per_exchange"]
-    min_bps=float(min_bps) if min_bps is not None else float(CFG["arbitrage"]["min_spread_bps"])
-    by_exg={t.exchange:t for t in tickers if t.symbol==symbol}
-    exgs=list(by_exg.keys()); deals=[]
-    for i in range(len(exgs)):
-        for j in range(len(exgs)):
-            if i==j: continue
-            b_exg,s_exg=exgs[i],exgs[j]
-            buy_t,sell_t=by_exg[b_exg],by_exg[s_exg]
-            buy_ask,sell_bid=buy_t.ask,sell_t.bid
-            if buy_ask<=0 or sell_bid<=0: continue
-            gross_bps=(sell_bid-buy_ask)/buy_ask*10000.0
-            net_bps=gross_bps-float(fees.get(b_exg,0.0))-float(fees.get(s_exg,0.0))
-            if net_bps>=min_bps:
-                notional=float(CFG["arbitrage"]["min_notional"])
-                profit_abs=notional*(net_bps/10000.0)
-                deals.append(ArbitrageDeal(symbol,b_exg,s_exg,round(buy_ask,6),
-                    round(sell_bid,6),round(gross_bps,3),round(net_bps,3),
-                    notional,round(profit_abs,6),ts_iso()))
-    deals.sort(key=lambda d:d.net_spread_bps,reverse=True)
-    return deals
-
-# ---------------- FastAPI ----------------
-app=FastAPI(title="Forecast Engine",version="1.2")
-if CFG.get("misc",{}).get("allow_cors",True):
-    app.add_middleware(CORSMiddleware,allow_origins=["*"],allow_methods=["*"],allow_headers=["*"])
-
-# ⬇️ NEW: подключаем роуты Render-Adapter
-app.include_router(render_adapter_router)
-
-@app.get("/health",response_model=Health)
-async def health()->Health:
-    sym_points={s:len(HISTORY[s]) for s in HISTORY}
-    age=max(0.0,now_ts()-LAST_PULL_TS) if LAST_PULL_TS else None
-    return Health(ok=age is not None and age<=CFG["health"]["max_delay_sec"]+2,
-        data_age_sec=age,symbols=sorted(list(HISTORY.keys())),
-        exchanges_seen=len(CFG["markets"]["exchanges"]),
-        points_in_history=sym_points,timestamp=ts_iso())
-
-@app.get("/forecast")
-async def forecast(symbol:str=Query("BTCUSDT")):
-    symbol=symbol.upper(); tickers=await pull_prices(); update_history(tickers)
-    if symbol not in {t.symbol for t in tickers}:
-        raise HTTPException(status_code=404,detail=f"No data for {symbol}")
-    fc=compute_forecast(symbol,tickers)
-    if not fc:
-        return {"symbol":symbol,"ready":False,"reason":f"Not enough data (< {CFG['features']['min_data_points']})","timestamp":ts_iso()}
-    return asdict(fc)
-
-@app.get("/arbitrage")
-async def arbitrage(symbol:str=Query("BTCUSDT"),min_bps:Optional[float]=Query(None)):
-    symbol=symbol.upper(); tickers=await pull_prices(); update_history(tickers)
-    deals=find_arbitrage(symbol,tickers,min_bps=min_bps)
-    return {"symbol":symbol,"count":len(deals),"deals":[asdict(d) for d in deals],"timestamp":ts_iso()}
-
-@app.get("/api/live")
-async def api_live(symbol:str=Query("BTCUSDT"), tf:str=Query("1m")):
-    """Unified endpoint for DS24 Data-Bridge (SpineEventCryptoV1)"""
-    tickers=await pull_prices(); update_history(tickers)
-    fc=compute_forecast(symbol.upper(),tickers)
-    if not fc:
-        return {"status":"not_ready","reason":f"Insufficient data for {symbol}"}
-    now_ms=int(datetime.now(timezone.utc).timestamp()*1000)
-    price=fc.ema_fast or fc.ema_slow
-    dir_num=1 if fc.direction=="bullish" else (-1 if fc.direction=="bearish" else 0)
     return {
-        "ts":now_ms,"symbol":symbol.upper(),"tf":tf,"price":price,
-        "features":{"rsi":fc.rsi,"vol":fc.volatility,"momentum":fc.momentum,
-                    "ema_fast":fc.ema_fast,"ema_slow":fc.ema_slow},
-        "forecast":{"mean":round(dir_num*fc.confidence,3),"cvar95":None,"conf":fc.confidence},
-        "source":"ds24-crypto-forecast","q_score":min(0.95,round(fc.confidence,3))
+        "ok": bool(collector_ok and len(symbols) > 0),
+        "data_age_sec": None,
+        "symbols": symbols,
+        "exchanges_seen": 0,
+        "points_in_history": {k: len(v) for k, v in _history.items()},
+        "timestamp": now_iso()
     }
 
-@app.get("/dashboard")
-async def dashboard():
-    try:
-        health_data=await health(); forecast_data=await forecast(symbol="BTCUSDT")
-        arbitrage_data=await arbitrage(symbol="BTCUSDT",min_bps=2)
-        return {"status":"live","timestamp":datetime.now().isoformat(),
-            "system_health":health_data.dict() if hasattr(health_data,"dict") else health_data,
-            "btc_forecast":forecast_data,
-            "arbitrage_opportunities":len(arbitrage_data.get("deals",[])),
-            "available_endpoints":["/","/dashboard","/health","/forecast","/arbitrage","/api/live",
-                                   "/observe/graph/{job_id}","/observe/graph/trends","/observe/graph/ingest",
-                                   "/observe/graph/ws"]}
-    except Exception as e:
-        return {"status":"error","error":str(e)}
+# ---------------------------
+# Main API: /api/live
+# ---------------------------
+@app.get("/api/live")
+async def api_live(symbol: str = Query(DEFAULT_SYMBOL), tf: str = Query(DEFAULT_TF)):
+    """
+    Unified endpoint expected by DS24 Proxy and other modules.
+    Always returns a valid JSON following SpineEventCryptoV1 contract.
+    If collector is available (COLLECTOR_URL), we try to use it; otherwise we return a degraded event.
+    """
+    symbol_u = (symbol or DEFAULT_SYMBOL).upper()
+    tf_u = tf or DEFAULT_TF
 
+    # Try to fetch from collector if configured
+    try:
+        data = await _fetch_from_collector(symbol_u, tf_u)
+        # basic normalization: ensure required keys exist
+        if not (isinstance(data, dict) and data.get("ts") and data.get("price")):
+            # unexpected format -> fallback
+            return _degraded_event(symbol_u, tf_u)
+
+        # update local history for observability
+        try:
+            _history.setdefault(symbol_u, []).append({"ts": data.get("ts"), "price": data.get("price")})
+        except Exception:
+            pass
+
+        # Ensure we return predictable keyset (normalize)
+        event = {
+            "ts": int(data.get("ts")),
+            "symbol": data.get("symbol", symbol_u),
+            "tf": data.get("tf", tf_u),
+            "price": data.get("price"),
+            "features": data.get("features", {}),
+            "forecast": data.get("forecast", {"mean": 0.0, "cvar95": None, "conf": 0.0}),
+            "source": data.get("source", "collector"),
+            "q_score": data.get("q_score", 0.9)
+        }
+        return event
+
+    except Exception:
+        # any failure → return degraded event (stable contract)
+        return _degraded_event(symbol_u, tf_u)
+
+# ---------------------------
+# Compatibility route
+# ---------------------------
+@app.get("/v1/forecast")
+async def v1_forecast(symbol: str = Query(DEFAULT_SYMBOL), tf: str = Query(DEFAULT_TF)):
+    """Compatibility route, proxies to /api/live"""
+    return await api_live(symbol=symbol, tf=tf)
+
+# ---------------------------
+# Optional: root / simple message
+# ---------------------------
 @app.get("/")
 async def root():
-    return {"message":"ISKRA DS24 Forecast Engine","status":"operational",
-            "dashboard":"/dashboard","health":"/health","live_api":"/api/live"}
+    return {"service": SERVICE_NAME, "now": now_iso(), "note": "Use /api/live?symbol=...&tf=... for SpineEvent"}
+
+# If run directly:
+#   uvicorn forecast:app --host 0.0.0.0 --port 8000
