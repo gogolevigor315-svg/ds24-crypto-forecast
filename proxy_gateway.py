@@ -20,15 +20,12 @@ PUBLIC_BASE = "https://ds24-proxy-gateway.onrender.com"
 # ─────────────────────────────────────────────────────────────
 #  BYBIT ENDPOINTS (REAL DATA)
 # ─────────────────────────────────────────────────────────────
-# Один и тот же endpoint:
-# - без symbol → все тикеры (для /trade/top10)
-# - с symbol   → конкретный тикер (для /live и feeder)
 BYBIT_MARKET_URL = os.getenv(
     "BYBIT_MARKET_URL",
     "https://api.bybit.com/v5/market/tickers?category=spot"
 )
 
-# UPSTREAM_GRAPH остаётся как есть (может быть внешний OBSERVE+ / GRAPH сервис)
+# UPSTREAM_GRAPH — внешний или локальный сервис
 UPSTREAM_GRAPH = os.getenv("UPSTREAM_GRAPH", "http://127.0.0.1:8000/observe/graph")
 
 CACHE_TTL = int(os.getenv("CACHE_TTL", "10"))
@@ -142,7 +139,7 @@ def _cache_put(key: str, data: Any, ttl: int = CACHE_TTL):
 
 
 # ─────────────────────────────────────────────────────────────
-# HTTP JSON CLIENT (GENERIC)
+# HTTP JSON CLIENT
 # ─────────────────────────────────────────────────────────────
 async def _get_json(url: str, params: Optional[dict] = None) -> Tuple[bool, Any, int]:
     try:
@@ -164,13 +161,10 @@ async def _get_json(url: str, params: Optional[dict] = None) -> Tuple[bool, Any,
 
 
 # ─────────────────────────────────────────────────────────────
-# BYBIT HELPERS
+# BYBIT TICKER HELPERS
 # ─────────────────────────────────────────────────────────────
 
 async def _bybit_ticker(symbol: str) -> Tuple[bool, Optional[dict], int]:
-    """
-    Реальный запрос к Bybit Spot v5 для одного тикера.
-    """
     ok, data, status = await _get_json(BYBIT_MARKET_URL, params={"symbol": symbol})
     if not ok:
         return False, data, status
@@ -184,17 +178,13 @@ async def _bybit_ticker(symbol: str) -> Tuple[bool, Optional[dict], int]:
         if not lst:
             return False, {"error": "empty_list", "raw": data}, 502
 
-        ticker = lst[0]
-        return True, ticker, 200
+        return True, lst[0], 200
+
     except Exception as e:
         return False, {"error": "parse_error", "details": str(e), "raw": data}, 502
 
 
 def _parse_bybit_ticker(symbol: str, ticker: dict, tf: str) -> dict:
-    """
-    Приводим Bybit-тикер к унифицированному ISKRA3-формату /live.
-    Всё основано на реальных полях ответа.
-    """
     def _f(x, default=None):
         if x is None:
             return default
@@ -209,14 +199,11 @@ def _parse_bybit_ticker(symbol: str, ticker: dict, tf: str) -> dict:
     high24 = _f(ticker.get("highPrice24h"), None)
     low24 = _f(ticker.get("lowPrice24h"), None)
 
-    # НЕЛИНЕЙНАЯ, НО РЕАЛЬНАЯ ОЦЕНКА (НЕ СИМУЛЯЦИЯ, А ФУНКЦИЯ ОТ РЫНКА)
-    # RSI_approx ~ позиция цены в дневном диапазоне
     if high24 is not None and low24 is not None and high24 > low24 and price is not None:
         rsi_approx = 100.0 * (price - low24) / (high24 - low24)
     else:
         rsi_approx = 50.0
 
-    # vol_index ~ модуль суточного % изменения, нормированный к 10%
     vol_index = min(max(abs(change24) / 0.10, 0.0), 1.0)
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -231,10 +218,10 @@ def _parse_bybit_ticker(symbol: str, ticker: dict, tf: str) -> dict:
             "volume24h": vol24,
             "high24h": high24,
             "low24h": low24,
-            "rsi_approx": rsi_approx,        # 0..100
-            "volatility_index": vol_index    # 0..1
+            "rsi_approx": rsi_approx,
+            "volatility_index": vol_index
         },
-        "forecast": {},  # тут пока пусто — это не симуляция, а отсутствие прогноза
+        "forecast": {},
         "source": "bybit-spot-v5",
         "q_score": None
     }
@@ -261,10 +248,6 @@ async def health():
 
 @app.get("/live")
 async def live(symbol: str = Query(...), tf: str = Query("1m")):
-    """
-    Реальные данные с Bybit Spot v5 по конкретному символу.
-    Без localhost, без фейковых цен.
-    """
     key = f"live:{symbol}:{tf}"
     cached = _cache_get(key)
     if cached:
@@ -281,10 +264,6 @@ async def live(symbol: str = Query(...), tf: str = Query("1m")):
 
 @app.get("/graph/{job_id}")
 async def graph(job_id: str):
-    """
-    GraphView: сначала пытаемся сходить в внешний UPSTREAM_GRAPH,
-    если не получилось — локальный fallback.
-    """
     url = f"{UPSTREAM_GRAPH.rstrip('/')}/{job_id}"
     ok, data, status = await _get_json(url)
 
@@ -295,8 +274,188 @@ async def graph(job_id: str):
 
 
 # ─────────────────────────────────────────────────────────────
-# INGEST (WITH FALLBACK)
+# INGEST PASS (FULLY RESTORED)
 # ─────────────────────────────────────────────────────────────
 
 @app.post("/ingest-pass")
-async
+async def ingest_pass(payload: dict):
+    url = f"{UPSTREAM_GRAPH.rstrip('/')}/ingest"
+    headers = {"Content-Type": "application/json"}
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+    if INGEST_SECRET:
+        sig = hmac.new(INGEST_SECRET.encode("utf-8"), body, hashlib.sha256).hexdigest()
+        headers.update({
+            "x-kid": INGEST_KID,
+            "x-ts": str(int(time.time() * 1000)),
+            "x-signature": sig
+        })
+
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as c:
+            r = await c.post(url, headers=headers, content=body)
+            if r.status_code < 400:
+                try:
+                    return r.json()
+                except Exception:
+                    return {"raw": r.text}
+    except Exception:
+        pass
+
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:
+        payload = {"job_id": "unknown"}
+
+    _graph_put(payload.get("job_id", "default"), payload)
+    return {"status": "ok", "fallback": "local"}
+
+
+# ─────────────────────────────────────────────────────────────
+# TOP10
+# ─────────────────────────────────────────────────────────────
+
+@app.get("/trade/top10")
+async def trade_top10():
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(BYBIT_MARKET_URL)
+            data = r.json()
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"error": "bybit_request_failed", "details": str(e)})
+
+    if not isinstance(data, dict) or data.get("retCode") != 0:
+        return JSONResponse(status_code=502, content={"error": "invalid_response_from_bybit", "raw": data})
+
+    result = data.get("result") or {}
+    tickers = result.get("list") or []
+    filtered = [t for t in tickers if t.get("symbol") in TOP10]
+    filtered_sorted = sorted(filtered, key=lambda x: TOP10.index(x["symbol"]))
+
+    def _f(x):
+        try:
+            return float(x)
+        except Exception:
+            return None
+
+    cleaned = [
+        {
+            "symbol": t.get("symbol"),
+            "price": _f(t.get("lastPrice")),
+            "change24h": _f(t.get("price24hPcnt")),
+            "volume": _f(t.get("turnover24h")),
+            "high": _f(t.get("highPrice24h")),
+            "low": _f(t.get("lowPrice24h")),
+            "bid1": _f(t.get("bid1Price")),
+            "ask1": _f(t.get("ask1Price")),
+        }
+        for t in filtered_sorted
+    ]
+
+    return {"top10": cleaned}
+
+
+# ─────────────────────────────────────────────────────────────
+# FEEDER
+# ─────────────────────────────────────────────────────────────
+
+async def feeder_send(payload: dict):
+    url = f"{PUBLIC_BASE}/ingest-pass"
+    async with httpx.AsyncClient(timeout=6.0) as c:
+        try:
+            await c.post(url, json=payload)
+        except Exception as e:
+            print("Feeder send error:", e)
+
+
+async def _feeder_loop():
+    if not FEEDER_ENABLED:
+        return
+
+    while True:
+        try:
+            ok, ticker, status = await _bybit_ticker(FEEDER_SYMBOL)
+            if not ok:
+                print("Feeder bybit error:", ticker)
+            else:
+                evt = _parse_bybit_ticker(FEEDER_SYMBOL, ticker, FEEDER_TF)
+                feat = evt.get("features", {})
+                rsi = float(feat.get("rsi_approx", 50.0) or 50.0)
+                vol_idx = float(feat.get("volatility_index", 0.5) or 0.5)
+
+                ts = evt.get("ts") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+                payload = {
+                    "job_id": FEEDER_JOB_ID,
+                    "decision_links": [
+                        {
+                            "from": "source:live",
+                            "to": "signal:rsi",
+                            "kind": "emits",
+                            "weight": round(min(max(rsi / 100.0, 0.0), 1.0), 3),
+                            "ts": ts
+                        },
+                        {
+                            "from": "source:live",
+                            "to": "signal:vol",
+                            "kind": "emits",
+                            "weight": round(min(max(vol_idx, 0.0), 1.0), 3),
+                            "ts": ts
+                        },
+                        {
+                            "from": "signal:rsi",
+                            "to": "policy:finops_guard",
+                            "kind": "influences",
+                            "weight": 0.6,
+                            "ts": ts
+                        },
+                        {
+                            "from": "signal:vol",
+                            "to": "risk:cvar",
+                            "kind": "influences",
+                            "weight": 0.7,
+                            "ts": ts
+                        }
+                    ],
+                    "arena_events": [
+                        {
+                            "id": f"tick-{ts}",
+                            "policy": "policy:finops_guard",
+                            "outcome": 0.001,
+                            "finops": 0.017,
+                            "dqi": 0.90,
+                            "ts": ts
+                        }
+                    ],
+                    "mind_reflect": [
+                        {
+                            "id": f"note-{ts}",
+                            "text": "live→graph via feeder (bybit)",
+                            "tags": ["reflect", "live", "bybit"],
+                            "ts": ts
+                        }
+                    ]
+                }
+
+                await feeder_send(payload)
+
+        except Exception as e:
+            print("Feeder loop error:", e)
+
+        await asyncio.sleep(FEEDER_INTERVAL_SEC)
+
+
+# ─────────────────────────────────────────────────────────────
+# STARTUP / SHUTDOWN
+# ─────────────────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def _on_startup():
+    app.state.feeder_task = asyncio.create_task(_feeder_loop())
+
+
+@app.on_event("shutdown")
+async def _on_shutdown():
+    t = getattr(app.state, "feeder_task", None)
+    if t:
+        t.cancel()
