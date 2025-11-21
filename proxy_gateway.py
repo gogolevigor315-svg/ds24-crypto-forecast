@@ -1,91 +1,111 @@
-# ds24-proxy-gateway (Binance REALDATA version)
-# Реальные данные с Binance Spot API, без Bybit, без Cloudflare, без воркеров.
+# ds24-proxy-gateway (REALDATA: Bybit via Cloudflare Worker)
+# + технически чистый API под ISKRA3
 
 import os
 import time
 import json
-import math
-from typing import Optional, Tuple, Dict, Any, List
+import asyncio
+from typing import Dict, Any, Tuple, Optional, List
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, Query
+import httpx
+from fastapi import FastAPI, Query, Path
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import httpx
 
 APP_NAME = "ds24-proxy-gateway"
 
 # ─────────────────────────────────────────────
-# BINANCE ENDPOINT
+# CONFIG
 # ─────────────────────────────────────────────
-BINANCE_BASE = os.getenv("BINANCE_BASE", "https://api.binance.com")
 
-CACHE_TTL = int(os.getenv("CACHE_TTL", "10"))
+PUBLIC_BASE = os.getenv(
+    "PUBLIC_BASE",
+    "https://ds24-crypto-forecast-1.onrender.com",
+)
+
+# Cloudflare Worker, который уже ходит на Bybit и обходит CloudFront
+BYBIT_WORKER_BASE = os.getenv(
+    "BYBIT_WORKER_BASE",
+    "https://polished-math-8078.gogolevigor315.workers.dev",
+)
+
+BYBIT_WORKER_TICKER_PATH = "/bybit/v5/market/tickers"
+
+CACHE_TTL = int(os.getenv("CACHE_TTL", "8"))
+
+FEEDER_ENABLED = os.getenv("FEEDER_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+FEEDER_SYMBOL = os.getenv("FEEDER_SYMBOL", "BTCUSDT")
+FEEDER_TF = os.getenv("FEEDER_TF", "1m")
+FEEDER_JOB_ID = os.getenv("FEEDER_JOB_ID", "portfolio-live")
+FEEDER_INTERVAL_SEC = int(os.getenv("FEEDER_INTERVAL_SEC", "20"))
+
+TOP10 = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
+    "DOGEUSDT", "TONUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT",
+]
 
 # ─────────────────────────────────────────────
-# LOCAL GRAPH STORAGE (простейший)
+# LOCAL GRAPH STORAGE (для /graph и /ingest-pass)
 # ─────────────────────────────────────────────
+
 _local_graph: Dict[str, Dict[str, Any]] = {}
 
 
 def _graph_get(job_id: str) -> Dict[str, Any]:
-    if job_id not in _local_graph:
-        _local_graph[job_id] = {
-            "nodes": [],
-            "edges": [],
-            "metrics": {
-                "dqi_avg": None,
-                "risk_cvar": None,
-                "finops_cost_usd": None,
-                "updated_at": None,
-            },
-        }
-    return _local_graph[job_id]
+    return _local_graph.get(job_id, {
+        "nodes": [],
+        "edges": [],
+        "metrics": {
+            "dqi_avg": None,
+            "risk_cvar": None,
+            "finops_cost_usd": None,
+            "updated_at": None,
+        },
+    })
 
 
-def _graph_put(job_id: str, payload: Dict[str, Any]):
+def _graph_put(job_id: str, payload: Dict[str, Any]) -> None:
     g = _graph_get(job_id)
 
-    def ensure_node(node_id: str):
-        if not any(n["id"] == node_id for n in g["nodes"]):
-            g["nodes"].append(
-                {
-                    "id": node_id,
-                    "label": node_id.split(":")[-1],
-                    "type": "signal",
-                    "score": None,
-                    "tags": [],
-                }
-            )
+    # Наращиваем nodes/edges по decision_links (минимально, без лишней логики)
+    for link in payload.get("decision_links", []) or []:
+        src = link.get("from")
+        tgt = link.get("to")
 
-    decision_links = payload.get("decision_links") or []
-    if isinstance(decision_links, list):
-        for e in decision_links:
-            src = e.get("from")
-            tgt = e.get("to")
-            if src:
-                ensure_node(src)
-            if tgt:
-                ensure_node(tgt)
-            g["edges"].append(
-                {
-                    "source": src,
-                    "target": tgt,
-                    "kind": e.get("kind", "signal"),
-                    "weight": float(e.get("weight", 0.5) or 0.5),
-                    "ts": e.get("ts") or datetime.now(timezone.utc).isoformat(),
-                }
-            )
+        if src and not any(n["id"] == src for n in g["nodes"]):
+            g["nodes"].append({
+                "id": src,
+                "label": src.split(":")[-1],
+                "type": "signal",
+                "score": None,
+                "tags": [],
+            })
+        if tgt and not any(n["id"] == tgt for n in g["nodes"]):
+            g["nodes"].append({
+                "id": tgt,
+                "label": tgt.split(":")[-1],
+                "type": "signal",
+                "score": None,
+                "tags": [],
+            })
 
-    g["metrics"]["updated_at"] = datetime.now(timezone.utc).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
+        g["edges"].append({
+            "source": src,
+            "target": tgt,
+            "kind": link.get("kind", "signal"),
+            "weight": link.get("weight", 0.5),
+            "ts": link.get("ts"),
+        })
+
+    g["metrics"]["updated_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     _local_graph[job_id] = g
 
 
 # ─────────────────────────────────────────────
-# FASTAPI APP
+# FASTAPI INIT
 # ─────────────────────────────────────────────
+
 app = FastAPI(title=APP_NAME)
 
 app.add_middleware(
@@ -97,12 +117,13 @@ app.add_middleware(
 )
 
 # ─────────────────────────────────────────────
-# SIMPLE CACHE
+# SIMPLE IN-MEMORY CACHE
 # ─────────────────────────────────────────────
+
 _cache: Dict[str, Tuple[Any, float]] = {}
 
 
-def _cache_get(key: str):
+def _cache_get(key: str) -> Optional[Any]:
     item = _cache.get(key)
     if not item:
         return None
@@ -113,26 +134,22 @@ def _cache_get(key: str):
     return data
 
 
-def _cache_put(key: str, data: Any, ttl: int = CACHE_TTL):
+def _cache_put(key: str, data: Any, ttl: int = CACHE_TTL) -> None:
     _cache[key] = (data, time.time() + ttl)
 
 
 # ─────────────────────────────────────────────
 # HTTP CLIENT
 # ─────────────────────────────────────────────
+
 async def _get_json(url: str, params: Optional[dict] = None) -> Tuple[bool, Any, int]:
     try:
-        async with httpx.AsyncClient(timeout=6.0) as c:
-            r = await c.get(url, params=params)
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get(url, params=params)
             ct = (r.headers.get("content-type") or "").lower()
 
             if r.status_code >= 400:
-                body = r.text
-                try:
-                    if "application/json" in ct:
-                        body = r.json()
-                except Exception:
-                    pass
+                body = r.text if "application/json" not in ct else r.json()
                 return False, {
                     "upstream_status": r.status_code,
                     "upstream_body": body,
@@ -142,61 +159,75 @@ async def _get_json(url: str, params: Optional[dict] = None) -> Tuple[bool, Any,
                 return True, r.json(), r.status_code
 
             return True, {"raw": r.text}, r.status_code
+
     except httpx.HTTPError as e:
-        return False, {"upstream_error": str(e), "url": url, "params": params}, 502
+        return False, {"upstream_error": str(e)}, 502
 
 
 # ─────────────────────────────────────────────
-# BINANCE HELPERS
+# BYBIT WORKER HELPERS
 # ─────────────────────────────────────────────
-async def _binance_ticker(symbol: str) -> Tuple[bool, Any, int]:
+
+async def _bybit_worker_ticker(symbol: str) -> Tuple[bool, Any, int]:
     """
-    /api/v3/ticker/24hr?symbol=BTCUSDT
+    Дергаем Cloudflare worker, который просто проксирует:
+    /bybit/v5/market/tickers?category=spot&symbol=...
+    и возвращает оригинальный JSON Bybit.
     """
-    url = f"{BINANCE_BASE.rstrip('/')}/api/v3/ticker/24hr"
-    ok, data, status = await _get_json(url, params={"symbol": symbol})
+    url = BYBIT_WORKER_BASE.rstrip("/") + BYBIT_WORKER_TICKER_PATH
+    params = {"category": "spot", "symbol": symbol}
+    ok, data, status = await _get_json(url, params=params)
     if not ok:
         return False, data, status
-    # ожидаем dict
-    if not isinstance(data, dict) or data.get("symbol") != symbol:
-        return False, {"error": "unexpected_binance_format", "raw": data}, 502
-    return True, data, 200
+
+    try:
+        if data.get("retCode") != 0:
+            return False, {
+                "error": "bybit_retcode",
+                "raw": data,
+            }, 502
+
+        result = data.get("result") or {}
+        lst = result.get("list") or []
+        if not lst:
+            return False, {"error": "empty_list", "raw": data}, 502
+
+        return True, lst[0], 200
+
+    except Exception as e:
+        return False, {"error": "parse_error", "details": str(e), "raw": data}, 502
 
 
-def _f(x, default=None):
-    if x is None:
+def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+    if value is None:
         return default
     try:
-        v = float(x)
-        if math.isfinite(v):
-            return v
-        return default
+        return float(value)
     except Exception:
         return default
 
 
-def _parse_binance_ticker(symbol: str, data: dict, tf: str) -> dict:
-    price = _f(data.get("lastPrice"))
-    change24 = _f(data.get("priceChangePercent"), 0.0)
-    vol24 = _f(data.get("volume"), 0.0)
-    high24 = _f(data.get("highPrice"))
-    low24 = _f(data.get("lowPrice"))
-    bid = _f(data.get("bidPrice"))
-    ask = _f(data.get("askPrice"))
+def _normalize_ticker(symbol: str, ticker: dict, tf: str) -> Dict[str, Any]:
+    price = _safe_float(ticker.get("lastPrice"))
+    change24 = _safe_float(ticker.get("price24hPcnt"), 0.0)
+    vol24 = _safe_float(ticker.get("turnover24h"), 0.0)
+    high24 = _safe_float(ticker.get("highPrice24h"))
+    low24 = _safe_float(ticker.get("lowPrice24h"))
+    bid1 = _safe_float(ticker.get("bid1Price"))
+    ask1 = _safe_float(ticker.get("ask1Price"))
 
-    # Мини-аналог rsi_approx по позиции в диапазоне
     if high24 is not None and low24 is not None and high24 > low24 and price is not None:
         rsi_approx = 100.0 * (price - low24) / (high24 - low24)
     else:
         rsi_approx = 50.0
 
-    vol_index = min(max(abs(change24) / 10.0, 0.0), 1.0)  # 10% → 1.0
+    vol_index = min(max(abs(change24) / 0.10, 0.0), 1.0)  # нормализованный "volatility index"
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     return {
         "ts": ts,
-        "symbol": data.get("symbol", symbol),
+        "symbol": ticker.get("symbol", symbol),
         "tf": tf,
         "price": price,
         "features": {
@@ -206,276 +237,292 @@ def _parse_binance_ticker(symbol: str, data: dict, tf: str) -> dict:
             "low24h": low24,
             "rsi_approx": rsi_approx,
             "volatility_index": vol_index,
-            "bid": bid,
-            "ask": ask,
+            "bid": bid1,
+            "ask": ask1,
         },
         "forecast": {},
-        "source": "binance-spot-v3",
+        "source": "bybit-spot-v5/worker",
         "q_score": None,
     }
 
 
 # ─────────────────────────────────────────────
-# INDICATORS / RISK / RADAR (локальные расчёты)
+# SYSTEM ENDPOINTS
 # ─────────────────────────────────────────────
-def _calc_rsi(closes: List[float], period: int = 14) -> Optional[float]:
-    if len(closes) < period + 1:
-        return None
-    gains = 0.0
-    losses = 0.0
-    for i in range(1, period + 1):
-        diff = closes[i] - closes[i - 1]
-        if diff > 0:
-            gains += diff
-        else:
-            losses -= diff
-    avg_gain = gains / period
-    avg_loss = losses / period
-    for i in range(period + 1, len(closes)):
-        diff = closes[i] - closes[i - 1]
-        gain = diff if diff > 0 else 0.0
-        loss = -diff if diff < 0 else 0.0
-        avg_gain = (avg_gain * (period - 1) + gain) / period
-        avg_loss = (avg_loss * (period - 1) + loss) / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100.0 - 100.0 / (1.0 + rs)
 
-
-def _ema(series: List[float], period: int) -> List[float]:
-    if not series:
-        return []
-    k = 2.0 / (period + 1.0)
-    out = []
-    prev = series[0]
-    out.append(prev)
-    for i in range(1, len(series)):
-        val = series[i] * k + prev * (1.0 - k)
-        out.append(val)
-        prev = val
-    return out
-
-
-def _calc_macd(closes: List[float], fast: int = 12, slow: int = 26, signal: int = 9):
-    if len(closes) < slow + signal:
-        return None
-    ema_fast = _ema(closes, fast)
-    ema_slow = _ema(closes, slow)
-    macd = [f - s for f, s in zip(ema_fast, ema_slow)]
-    # signal line
-    sig = _ema(macd[slow - 1 :], signal)
-    if not sig:
-        return None
-    return {"macd": macd[-1], "signal": sig[-1]}
-
-
-def _calc_atr(highs: List[float], lows: List[float], closes: List[float], period: int = 14):
-    if not (len(highs) == len(lows) == len(closes)):
-        return None
-    if len(highs) < period + 1:
-        return None
-    trs = []
-    for i in range(1, len(highs)):
-        h = highs[i]
-        l = lows[i]
-        pc = closes[i - 1]
-        tr = max(h - l, abs(h - pc), abs(l - pc))
-        trs.append(tr)
-    atr = sum(trs[:period]) / period
-    for i in range(period, len(trs)):
-        atr = (atr * (period - 1) + trs[i]) / period
-    return atr
-
-
-def _calc_risk(closes: List[float]):
-    if len(closes) < 2:
-        return {"riskScore": None, "riskLevel": "unknown"}
-    rets = []
-    for i in range(1, len(closes)):
-        if closes[i - 1] == 0:
-            continue
-        rets.append((closes[i] - closes[i - 1]) / closes[i - 1])
-    if not rets:
-        return {"riskScore": None, "riskLevel": "unknown"}
-    mean = sum(rets) / len(rets)
-    var = sum((r - mean) ** 2 for r in rets) / len(rets)
-    vol = math.sqrt(var)
-    score = max(0, min(100, round(vol * 1000)))
-    if score < 30:
-        level = "low"
-    elif score > 70:
-        level = "high"
-    else:
-        level = "medium"
-    return {"riskScore": score, "riskLevel": level}
-
-
-def _radar_forecast(closes: List[float]):
-    if len(closes) < 2:
-        return {"direction": "flat", "confidence": 0.0}
-    first = closes[0]
-    last = closes[-1]
-    if first == 0:
-        return {"direction": "flat", "confidence": 0.0}
-    ret = (last - first) / first
-    if ret > 0.002:
-        direction = "up"
-    elif ret < -0.002:
-        direction = "down"
-    else:
-        direction = "flat"
-    confidence = max(0.0, min(1.0, abs(ret) * 50.0))
-    return {"direction": direction, "confidence": confidence}
-
-
-# ─────────────────────────────────────────────
-# ENDPOINTS
-# ─────────────────────────────────────────────
 @app.get("/health")
-async def health():
+async def health() -> Dict[str, Any]:
     return {
         "ok": True,
         "app": APP_NAME,
         "ts": int(time.time()),
-        "binance_base": BINANCE_BASE,
+        "feeder": {
+            "enabled": FEEDER_ENABLED,
+            "symbol": FEEDER_SYMBOL,
+            "tf": FEEDER_TF,
+            "job_id": FEEDER_JOB_ID,
+            "interval_sec": FEEDER_INTERVAL_SEC,
+        },
         "graph_jobs": list(_local_graph.keys()),
+        "gateway_public": PUBLIC_BASE,
+        "worker_base": BYBIT_WORKER_BASE,
     }
 
 
+# ─────────────────────────────────────────────
+# REALDATA ENDPOINTS
+# ─────────────────────────────────────────────
+
 @app.get("/live")
-async def live(symbol: str = Query(...), tf: str = Query("1m")):
+async def get_live(
+    symbol: str = Query(..., description="Spot symbol, e.g. BTCUSDT"),
+    tf: str = Query("1m", description="Synthetic timeframe tag"),
+):
     key = f"live:{symbol}:{tf}"
     cached = _cache_get(key)
-    if cached:
+    if cached is not None:
         return {"cached": True, **cached}
 
-    ok, data, status = await _binance_ticker(symbol)
+    ok, ticker, status = await _bybit_worker_ticker(symbol)
     if not ok:
-        return JSONResponse(status_code=status, content={"proxy": APP_NAME, "error": data})
+        return JSONResponse(status_code=status, content={"proxy": APP_NAME, "error": ticker})
 
-    event = _parse_binance_ticker(symbol, data, tf)
+    event = _normalize_ticker(symbol, ticker, tf)
     _cache_put(key, event)
     return {"cached": False, **event}
 
 
 @app.get("/trade/top10")
-async def trade_top10():
-    """
-    Топ-10 USDT-пар по объёму с Binance.
-    """
-    url = f"{BINANCE_BASE.rstrip('/')}/api/v3/ticker/24hr"
-    ok, data, status = await _get_json(url)
-    if not ok:
-        return JSONResponse(status_code=status, content={"proxy": APP_NAME, "error": data})
+async def get_top10():
+    items: List[Dict[str, Any]] = []
 
-    if not isinstance(data, list):
-        return JSONResponse(
-            status_code=502,
-            content={"proxy": APP_NAME, "error": "unexpected_binance_list_format", "raw": data},
-        )
+    for sym in TOP10:
+        ok, ticker, status = await _bybit_worker_ticker(sym)
+        if not ok:
+            # Добавляем упрощённую ошибку по символу, но не роняем весь список
+            items.append({
+                "symbol": sym,
+                "error": True,
+                "details": ticker,
+            })
+            continue
 
-    # фильтруем только USDT-пары
-    usdt = [t for t in data if isinstance(t, dict) and isinstance(t.get("symbol"), str) and t["symbol"].endswith("USDT")]
-    # сортируем по quoteVolume (если есть) или volume
-    def _vol(t):
-        qv = _f(t.get("quoteVolume"))
-        if qv is not None:
-            return qv
-        return _f(t.get("volume"), 0.0)
+        norm = _normalize_ticker(sym, ticker, tf="1m")
+        feat = norm.get("features", {})
 
-    usdt_sorted = sorted(usdt, key=_vol, reverse=True)
-    top10 = usdt_sorted[:10]
+        items.append({
+            "symbol": norm.get("symbol", sym),
+            "price": norm.get("price"),
+            "change24h": feat.get("change24h"),
+            "volume": feat.get("volume24h"),
+            "high": feat.get("high24h"),
+            "low": feat.get("low24h"),
+            "bid1": feat.get("bid"),
+            "ask1": feat.get("ask"),
+        })
 
-    cleaned = []
-    for t in top10:
-        cleaned.append(
-            {
-                "symbol": t.get("symbol"),
-                "price": _f(t.get("lastPrice")),
-                "change24h": _f(t.get("priceChangePercent")),
-                "volume": _f(t.get("volume")),
-                "high": _f(t.get("highPrice")),
-                "low": _f(t.get("lowPrice")),
-                "bid1": _f(t.get("bidPrice")),
-                "ask1": _f(t.get("askPrice")),
-            }
-        )
-
-    return {"top10": cleaned}
+    return {"top10": items}
 
 
 # ─────────────────────────────────────────────
-# GRAPH ENDPOINTS
+# GRAPH & INGEST
 # ─────────────────────────────────────────────
+
 @app.get("/graph/{job_id}")
-async def graph(job_id: str):
+async def get_graph(
+    job_id: str = Path(..., description="Graph job id"),
+) -> Dict[str, Any]:
     g = _graph_get(job_id)
-    return {"cached": True, "fallback": "local", **g}
+    g_out = {"cached": True, "fallback": "local"}
+    g_out.update(g)
+    return g_out
 
 
 @app.post("/ingest-pass")
-async def ingest_pass(payload: dict):
-    job_id = payload.get("job_id", "default")
+async def ingest_graph(payload: Dict[str, Any]):
+    """
+    Принимаем payload с decision_links / arena_events / mind_reflect.
+    Сохраняем в локальный _local_graph, чтобы ISKRA3 могла читать через /graph/{job_id}.
+    """
+    job_id = payload.get("job_id") or "default"
     _graph_put(job_id, payload)
     return {"status": "ok", "fallback": "local"}
 
 
 # ─────────────────────────────────────────────
-# INDICATORS / RISK / RADAR
+# SIMPLE INDICATORS (RSI / MACD / ATR)
 # ─────────────────────────────────────────────
+
+def _rsi(closes: List[float], period: int = 14) -> float:
+    if len(closes) <= period:
+        return 50.0
+    gains = []
+    losses = []
+    for i in range(1, period + 1):
+        diff = closes[-i] - closes[-i - 1]
+        if diff >= 0:
+            gains.append(diff)
+        else:
+            losses.append(-diff)
+    avg_gain = sum(gains) / period if gains else 0.0
+    avg_loss = sum(losses) / period if losses else 0.0
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
 @app.post("/indicators/rsi")
-async def indicators_rsi(payload: dict):
-    closes = payload.get("closes") or []
-    closes_f = [float(x) for x in closes]
-    rsi_val = _calc_rsi(closes_f)
-    return {"rsi": rsi_val}
+async def calc_rsi(body: Dict[str, Any]):
+    closes = body.get("closes") or []
+    closes_f = [_safe_float(c, 0.0) for c in closes]
+    value = _rsi(closes_f)
+    return {"rsi": value}
 
 
 @app.post("/indicators/macd")
-async def indicators_macd(payload: dict):
-    closes = payload.get("closes") or []
-    closes_f = [float(x) for x in closes]
-    res = _calc_macd(closes_f)
-    if not res:
-        return {"macd": None, "signal": None}
-    return res
+async def calc_macd(body: Dict[str, Any]):
+    closes = body.get("closes") or []
+    closes_f = [_safe_float(c, 0.0) for c in closes]
+
+    def ema(values: List[float], period: int) -> float:
+        if not values:
+            return 0.0
+        k = 2 / (period + 1)
+        ema_val = values[0]
+        for v in values[1:]:
+            ema_val = v * k + ema_val * (1 - k)
+        return ema_val
+
+    fast = ema(closes_f, 12)
+    slow = ema(closes_f, 26)
+    macd_val = fast - slow
+    signal = ema([macd_val], 9)
+    return {"macd": macd_val, "signal": signal}
 
 
 @app.post("/indicators/atr")
-async def indicators_atr(payload: dict):
-    highs = [float(x) for x in (payload.get("highs") or [])]
-    lows = [float(x) for x in (payload.get("lows") or [])]
-    closes = [float(x) for x in (payload.get("closes") or [])]
-    atr_val = _calc_atr(highs, lows, closes)
+async def calc_atr(body: Dict[str, Any]):
+    highs = body.get("highs") or []
+    lows = body.get("lows") or []
+    closes = body.get("closes") or []
+
+    n = min(len(highs), len(lows), len(closes))
+    if n < 2:
+        return {"atr": 0.0}
+
+    trs: List[float] = []
+    for i in range(1, n):
+        h = _safe_float(highs[i], 0.0)
+        l = _safe_float(lows[i], 0.0)
+        c_prev = _safe_float(closes[i - 1], 0.0)
+        tr = max(h - l, abs(h - c_prev), abs(l - c_prev))
+        trs.append(tr)
+
+    atr_val = sum(trs) / len(trs) if trs else 0.0
     return {"atr": atr_val}
 
 
+# ─────────────────────────────────────────────
+# RISK & RADAR (ПРОСТЫЕ ХЕЛПЕРЫ)
+# ─────────────────────────────────────────────
+
 @app.post("/risk/calc")
-async def risk_calc(payload: dict):
-    closes = [float(x) for x in (payload.get("closes") or [])]
-    return _calc_risk(closes)
+async def risk_calc(body: Dict[str, Any]):
+    closes = body.get("closes") or []
+    closes_f = [_safe_float(c, 0.0) for c in closes]
+    if len(closes_f) < 2:
+        return {"riskScore": 0.0, "riskLevel": "LOW"}
+
+    mean = sum(closes_f) / len(closes_f)
+    var = sum((c - mean) ** 2 for c in closes_f) / len(closes_f)
+    vol = var ** 0.5
+
+    if vol < 0.005 * mean:
+        level = "LOW"
+    elif vol < 0.02 * mean:
+        level = "MEDIUM"
+    else:
+        level = "HIGH"
+
+    return {"riskScore": vol, "riskLevel": level}
 
 
 @app.post("/radar/forecast")
-async def radar_forecast(payload: dict):
-    closes = [float(x) for x in (payload.get("closes") or [])]
-    return _radar_forecast(closes)
+async def radar_forecast(body: Dict[str, Any]):
+    closes = body.get("closes") or []
+    closes_f = [_safe_float(c, 0.0) for c in closes]
+    if len(closes_f) < 2:
+        return {"direction": "flat", "confidence": 0.0}
+
+    last = closes_f[-1]
+    prev = closes_f[-2]
+    diff = last - prev
+    if diff > 0:
+        direction = "up"
+    elif diff < 0:
+        direction = "down"
+    else:
+        direction = "flat"
+
+    magnitude = abs(diff) / (prev or 1.0)
+    confidence = max(0.0, min(magnitude * 10.0, 1.0))
+
+    return {"direction": direction, "confidence": confidence}
 
 
 # ─────────────────────────────────────────────
-# SNAPSHOT / EVENTS / GOVERNANCE (заглушки)
+# SNAPSHOT / EVENTS / GOVERNANCE — STUBS
 # ─────────────────────────────────────────────
+
 @app.post("/snapshot/create")
-async def snapshot_create(payload: dict):
-    return {"status": "ok"}
+async def create_snapshot(body: Dict[str, Any]):
+    # здесь можно сохранять state_hash/proof_hash в хранилище; пока — просто echo
+    return {"status": "created"}
 
 
 @app.post("/events/route")
-async def events_route(payload: dict):
-    return {"ok": True}
+async def route_event(body: Dict[str, Any]):
+    # просто echo-маршрутизатор, чтобы ISKRA3 могла писать event-stream
+    return {"ok": True, "echo": body}
 
 
 @app.post("/governance/policy")
-async def governance_policy(payload: dict):
-    return {"applied": True}
+async def apply_policy(body: Dict[str, Any]):
+    rule = body.get("rule")
+    value = body.get("value")
+    # здесь можно применять свои политические правила; пока считается, что применено
+    return {"applied": True, "rule": rule, "value": value}
+
+
+# ─────────────────────────────────────────────
+# FEEDER LOOP (ОПЦИОНАЛЬНО)
+# ─────────────────────────────────────────────
+
+async def _feeder_loop():
+    if not FEEDER_ENABLED:
+        return
+
+    while True:
+        try:
+            ok, ticker, _ = await _bybit_worker_ticker(FEEDER_SYMBOL)
+            if ok:
+                # В минимальном варианте просто дергаем, чтобы не простаивал воркер.
+                pass
+        except Exception as e:
+            print("Feeder error:", e)
+
+        await asyncio.sleep(FEEDER_INTERVAL_SEC)
+
+
+@app.on_event("startup")
+async def _on_startup():
+    if FEEDER_ENABLED:
+        app.state.feeder_task = asyncio.create_task(_feeder_loop())
+
+
+@app.on_event("shutdown")
+async def _on_shutdown():
+    t = getattr(app.state, "feeder_task", None)
+    if t:
+        t.cancel()
