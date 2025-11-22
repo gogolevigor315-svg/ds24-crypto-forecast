@@ -1,5 +1,6 @@
-# ds24-proxy-gateway (REALDATA: Bybit via Cloudflare Worker)
-# + технически чистый API под ISKRA3
+# ds24-proxy-gateway (DS24 Market Relay: CryptoCompare + CoinAPI)
+# Без прямых бирж, без CloudFront, без гео-банов.
+# Единый поток данных для ISKRA3.
 
 import os
 import time
@@ -13,24 +14,23 @@ from fastapi import FastAPI, Query, Path
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-APP_NAME = "ds24-proxy-gateway"
+APP_NAME = "ds24-market-relay"
 
 # ─────────────────────────────────────────────
-# CONFIG
+# CONFIG: PROVIDERS
 # ─────────────────────────────────────────────
 
-PUBLIC_BASE = os.getenv(
-    "PUBLIC_BASE",
-    "https://ds24-crypto-forecast-1.onrender.com",
+CRYPTOCOMPARE_API_KEY = os.getenv("CRYPTOCOMPARE_API_KEY", "").strip()
+CRYPTOCOMPARE_BASE = os.getenv(
+    "CRYPTOCOMPARE_BASE",
+    "https://min-api.cryptocompare.com",
 )
 
-# Cloudflare Worker, который уже ходит на Bybit и обходит CloudFront
-BYBIT_WORKER_BASE = os.getenv(
-    "BYBIT_WORKER_BASE",
-    "https://polished-math-8078.gogolevigor315.workers.dev",
+COINAPI_API_KEY = os.getenv("COINAPI_API_KEY", "").strip()
+COINAPI_BASE = os.getenv(
+    "COINAPI_BASE",
+    "https://rest.coinapi.io",
 )
-
-BYBIT_WORKER_TICKER_PATH = "/bybit/v5/market/tickers"
 
 CACHE_TTL = int(os.getenv("CACHE_TTL", "8"))
 
@@ -40,13 +40,10 @@ FEEDER_TF = os.getenv("FEEDER_TF", "1m")
 FEEDER_JOB_ID = os.getenv("FEEDER_JOB_ID", "portfolio-live")
 FEEDER_INTERVAL_SEC = int(os.getenv("FEEDER_INTERVAL_SEC", "20"))
 
-TOP10 = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
-    "DOGEUSDT", "TONUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT",
-]
+TOP10_TSYMBOL = os.getenv("TOP10_TSYMBOL", "USDT")
 
 # ─────────────────────────────────────────────
-# LOCAL GRAPH STORAGE (для /graph и /ingest-pass)
+# LOCAL GRAPH STORAGE
 # ─────────────────────────────────────────────
 
 _local_graph: Dict[str, Dict[str, Any]] = {}
@@ -68,7 +65,6 @@ def _graph_get(job_id: str) -> Dict[str, Any]:
 def _graph_put(job_id: str, payload: Dict[str, Any]) -> None:
     g = _graph_get(job_id)
 
-    # Наращиваем nodes/edges по decision_links (минимально, без лишней логики)
     for link in payload.get("decision_links", []) or []:
         src = link.get("from")
         tgt = link.get("to")
@@ -117,7 +113,7 @@ app.add_middleware(
 )
 
 # ─────────────────────────────────────────────
-# SIMPLE IN-MEMORY CACHE
+# SIMPLE CACHE
 # ─────────────────────────────────────────────
 
 _cache: Dict[str, Tuple[Any, float]] = {}
@@ -142,10 +138,14 @@ def _cache_put(key: str, data: Any, ttl: int = CACHE_TTL) -> None:
 # HTTP CLIENT
 # ─────────────────────────────────────────────
 
-async def _get_json(url: str, params: Optional[dict] = None) -> Tuple[bool, Any, int]:
+async def _get_json(
+    url: str,
+    params: Optional[dict] = None,
+    headers: Optional[dict] = None,
+) -> Tuple[bool, Any, int]:
     try:
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            r = await client.get(url, params=params)
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(url, params=params, headers=headers)
             ct = (r.headers.get("content-type") or "").lower()
 
             if r.status_code >= 400:
@@ -153,6 +153,8 @@ async def _get_json(url: str, params: Optional[dict] = None) -> Tuple[bool, Any,
                 return False, {
                     "upstream_status": r.status_code,
                     "upstream_body": body,
+                    "url": url,
+                    "params": params,
                 }, r.status_code
 
             if "application/json" in ct:
@@ -161,87 +163,270 @@ async def _get_json(url: str, params: Optional[dict] = None) -> Tuple[bool, Any,
             return True, {"raw": r.text}, r.status_code
 
     except httpx.HTTPError as e:
-        return False, {"upstream_error": str(e)}, 502
+        return False, {"upstream_error": str(e), "url": url, "params": params}, 502
 
 
-# ─────────────────────────────────────────────
-# BYBIT WORKER HELPERS
-# ─────────────────────────────────────────────
-
-async def _bybit_worker_ticker(symbol: str) -> Tuple[bool, Any, int]:
-    """
-    Дергаем Cloudflare worker, который просто проксирует:
-    /bybit/v5/market/tickers?category=spot&symbol=...
-    и возвращает оригинальный JSON Bybit.
-    """
-    url = BYBIT_WORKER_BASE.rstrip("/") + BYBIT_WORKER_TICKER_PATH
-    params = {"category": "spot", "symbol": symbol}
-    ok, data, status = await _get_json(url, params=params)
-    if not ok:
-        return False, data, status
-
-    try:
-        if data.get("retCode") != 0:
-            return False, {
-                "error": "bybit_retcode",
-                "raw": data,
-            }, 502
-
-        result = data.get("result") or {}
-        lst = result.get("list") or []
-        if not lst:
-            return False, {"error": "empty_list", "raw": data}, 502
-
-        return True, lst[0], 200
-
-    except Exception as e:
-        return False, {"error": "parse_error", "details": str(e), "raw": data}, 502
-
-
-def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
-    if value is None:
+def _safe_float(val: Any, default: Optional[float] = None) -> Optional[float]:
+    if val is None:
         return default
     try:
-        return float(value)
+        return float(val)
     except Exception:
         return default
 
 
-def _normalize_ticker(symbol: str, ticker: dict, tf: str) -> Dict[str, Any]:
-    price = _safe_float(ticker.get("lastPrice"))
-    change24 = _safe_float(ticker.get("price24hPcnt"), 0.0)
-    vol24 = _safe_float(ticker.get("turnover24h"), 0.0)
-    high24 = _safe_float(ticker.get("highPrice24h"))
-    low24 = _safe_float(ticker.get("lowPrice24h"))
-    bid1 = _safe_float(ticker.get("bid1Price"))
-    ask1 = _safe_float(ticker.get("ask1Price"))
+# ─────────────────────────────────────────────
+# SYMBOL HELPERS
+# ─────────────────────────────────────────────
 
-    if high24 is not None and low24 is not None and high24 > low24 and price is not None:
-        rsi_approx = 100.0 * (price - low24) / (high24 - low24)
+def _split_symbol(symbol: str) -> Tuple[str, str]:
+    """
+    Примитивный парсер для крипты: BTCUSDT, ETHUSD, ETHUSDC и т.п.
+    """
+    s = symbol.upper()
+    for q in ("USDT", "USDC", "USD", "EUR", "BTC", "ETH"):
+        if s.endswith(q):
+            return s[:-len(q)], q
+    # fallback
+    if len(s) > 3:
+        return s[:-3], s[-3:]
+    return s, ""
+
+
+# ─────────────────────────────────────────────
+# CRYPTOCOMPARE PROVIDER
+# ─────────────────────────────────────────────
+
+async def _cc_live(symbol: str) -> Tuple[bool, Any]:
+    base, quote = _split_symbol(symbol)
+    fsym = base
+    tsym = quote or TOP10_TSYMBOL
+
+    url = CRYPTOCOMPARE_BASE.rstrip("/") + "/data/pricemultifull"
+    params = {"fsyms": fsym, "tsyms": tsym}
+    if CRYPTOCOMPARE_API_KEY:
+        params["api_key"] = CRYPTOCOMPARE_API_KEY
+
+    ok, data, status = await _get_json(url, params=params)
+    if not ok:
+        return False, {"provider": "cryptocompare", "error": data, "status": status}
+
+    try:
+        raw = data.get("RAW", {})
+        fs = raw.get(fsym, {})
+        ts = fs.get(tsym)
+        if not ts:
+            return False, {"provider": "cryptocompare", "error": "no_ticker"}
+
+        return True, {
+            "provider": "cryptocompare",
+            "symbol": symbol,
+            "fsym": fsym,
+            "tsym": tsym,
+            "price": _safe_float(ts.get("PRICE")),
+            "change24h": _safe_float(ts.get("CHANGE24HOUR")),
+            "volume24h": _safe_float(ts.get("TOTALVOLUME24H")),
+            "high24h": _safe_float(ts.get("HIGH24HOUR")),
+            "low24h": _safe_float(ts.get("LOW24HOUR")),
+            "bid": _safe_float(ts.get("BID")),
+            "ask": _safe_float(ts.get("ASK")),
+        }
+    except Exception as e:
+        return False, {"provider": "cryptocompare", "error": "parse_error", "details": str(e)}
+
+
+async def _cc_ohlcv(symbol: str, tf: str, limit: int = 100) -> Tuple[bool, Any]:
+    base, quote = _split_symbol(symbol)
+    fsym = base
+    tsym = quote or TOP10_TSYMBOL
+
+    tf = tf.lower()
+    if tf.endswith("m"):
+        url_path = "/data/v2/histominute"
+    elif tf.endswith("h"):
+        url_path = "/data/v2/histohour"
     else:
-        rsi_approx = 50.0
+        url_path = "/data/v2/histoday"
 
-    vol_index = min(max(abs(change24) / 0.10, 0.0), 1.0)  # нормализованный "volatility index"
+    url = CRYPTOCOMPARE_BASE.rstrip("/") + url_path
+    params = {
+        "fsym": fsym,
+        "tsym": tsym,
+        "limit": min(limit, 2000),
+    }
+    if CRYPTOCOMPARE_API_KEY:
+        params["api_key"] = CRYPTOCOMPARE_API_KEY
+
+    ok, data, status = await _get_json(url, params=params)
+    if not ok:
+        return False, {"provider": "cryptocompare", "error": data, "status": status}
+
+    try:
+        if data.get("Response") != "Success":
+            return False, {"provider": "cryptocompare", "error": "not_success", "raw": data}
+
+        dlist = data.get("Data", {}).get("Data", [])
+        candles = []
+        for c in dlist:
+            candles.append({
+                "ts": c.get("time"),
+                "open": _safe_float(c.get("open")),
+                "high": _safe_float(c.get("high")),
+                "low": _safe_float(c.get("low")),
+                "close": _safe_float(c.get("close")),
+                "volume": _safe_float(c.get("volumefrom")),
+            })
+        return True, candles
+
+    except Exception as e:
+        return False, {"provider": "cryptocompare", "error": "parse_error", "details": str(e)}
+
+
+async def _cc_top10() -> Tuple[bool, Any]:
+    """
+    Топ-10 по объёму к USDT.
+    """
+    url = CRYPTOCOMPARE_BASE.rstrip("/") + "/data/top/totalvolfull"
+    params = {
+        "limit": 10,
+        "tsym": TOP10_TSYMBOL,
+    }
+    if CRYPTOCOMPARE_API_KEY:
+        params["api_key"] = CRYPTOCOMPARE_API_KEY
+
+    ok, data, status = await _get_json(url, params=params)
+    if not ok:
+        return False, {"provider": "cryptocompare", "error": data, "status": status}
+
+    try:
+        dlist = data.get("Data", []) or []
+        out: List[Dict[str, Any]] = []
+        for item in dlist:
+            coin_info = item.get("CoinInfo", {}) or {}
+            raw = item.get("RAW", {}) or {}
+            ts = raw.get(TOP10_TSYMBOL, {}) or {}
+            symbol = coin_info.get("Name")
+            if not symbol:
+                continue
+            out.append({
+                "symbol": symbol + TOP10_TSYMBOL,
+                "price": _safe_float(ts.get("PRICE")),
+                "change24h": _safe_float(ts.get("CHANGE24HOUR")),
+                "volume": _safe_float(ts.get("TOTALVOLUME24H")),
+                "high": _safe_float(ts.get("HIGH24HOUR")),
+                "low": _safe_float(ts.get("LOW24HOUR")),
+                "bid1": _safe_float(ts.get("BID")),
+                "ask1": _safe_float(ts.get("ASK")),
+            })
+        return True, out
+    except Exception as e:
+        return False, {"provider": "cryptocompare", "error": "parse_error", "details": str(e)}
+
+
+# ─────────────────────────────────────────────
+# COINAPI PROVIDER
+# ─────────────────────────────────────────────
+
+async def _ca_live(symbol: str) -> Tuple[bool, Any]:
+    if not COINAPI_API_KEY:
+        return False, {"provider": "coinapi", "error": "no_api_key"}
+
+    base, quote = _split_symbol(symbol)
+    # по умолчанию Binance Spot-маркет
+    asset_id = f"BINANCE_SPOT_{base}_{quote}"
+
+    url = COINAPI_BASE.rstrip("/") + "/v1/quotes/current"
+    headers = {"X-CoinAPI-Key": COINAPI_API_KEY}
+    params = {"filter_symbol": asset_id}
+
+    ok, data, status = await _get_json(url, params=params, headers=headers)
+    if not ok:
+        return False, {"provider": "coinapi", "error": data, "status": status}
+
+    try:
+        quotes = data if isinstance(data, list) else data.get("data") or data
+        if isinstance(quotes, dict):
+            quotes = [quotes]
+        if not quotes:
+            return False, {"provider": "coinapi", "error": "empty_quotes", "raw": data}
+
+        q = quotes[0]
+        last = _safe_float(q.get("last_price")) or _safe_float(q.get("ask_price")) or _safe_float(q.get("bid_price"))
+        bid = _safe_float(q.get("bid_price"))
+        ask = _safe_float(q.get("ask_price"))
+
+        return True, {
+            "provider": "coinapi",
+            "symbol": symbol,
+            "asset_id": asset_id,
+            "price": last,
+            "bid": bid,
+            "ask": ask,
+        }
+    except Exception as e:
+        return False, {"provider": "coinapi", "error": "parse_error", "details": str(e)}
+
+
+# ─────────────────────────────────────────────
+# AGGREGATOR (CryptoCompare + CoinAPI)
+# ─────────────────────────────────────────────
+
+async def _merged_live(symbol: str, tf: str) -> Tuple[bool, Any]:
+    cc_ok, cc_data = await _cc_live(symbol)
+    ca_ok, ca_data = await _ca_live(symbol)
+
+    if not cc_ok and not ca_ok:
+        return False, {
+            "error": "both_providers_failed",
+            "cc": cc_data,
+            "ca": ca_data,
+        }
+
+    primary = None
+    secondary = None
+
+    if cc_ok:
+        primary = cc_data
+        if ca_ok:
+            secondary = ca_data
+    else:
+        primary = ca_data
+        secondary = cc_data if cc_ok else None
+
+    p_price = _safe_float(primary.get("price"))
+    s_price = _safe_float(secondary.get("price")) if secondary else None
+
+    divergence = None
+    anomaly = False
+    if p_price is not None and s_price is not None and s_price > 0:
+        divergence = abs(p_price - s_price) / ((p_price + s_price) / 2.0)
+        if divergence > 0.01:  # >1% расхождение
+            anomaly = True
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    return {
+    features = {
+        "change24h": primary.get("change24h"),
+        "volume24h": primary.get("volume24h"),
+        "high24h": primary.get("high24h"),
+        "low24h": primary.get("low24h"),
+        "bid": primary.get("bid"),
+        "ask": primary.get("ask"),
+        "primary_source": primary.get("provider"),
+        "secondary_source": secondary.get("provider") if secondary else None,
+        "secondary_price": s_price,
+        "price_divergence": divergence,
+        "anomaly": anomaly,
+    }
+
+    return True, {
         "ts": ts,
-        "symbol": ticker.get("symbol", symbol),
+        "symbol": symbol,
         "tf": tf,
-        "price": price,
-        "features": {
-            "change24h": change24,
-            "volume24h": vol24,
-            "high24h": high24,
-            "low24h": low24,
-            "rsi_approx": rsi_approx,
-            "volatility_index": vol_index,
-            "bid": bid1,
-            "ask": ask1,
-        },
+        "price": p_price,
+        "features": features,
         "forecast": {},
-        "source": "bybit-spot-v5/worker",
+        "source": "ds24-relay",
         "q_score": None,
     }
 
@@ -256,6 +441,16 @@ async def health() -> Dict[str, Any]:
         "ok": True,
         "app": APP_NAME,
         "ts": int(time.time()),
+        "providers": {
+            "cryptocompare": {
+                "base": CRYPTOCOMPARE_BASE,
+                "api_key_set": bool(CRYPTOCOMPARE_API_KEY),
+            },
+            "coinapi": {
+                "base": COINAPI_BASE,
+                "api_key_set": bool(COINAPI_API_KEY),
+            },
+        },
         "feeder": {
             "enabled": FEEDER_ENABLED,
             "symbol": FEEDER_SYMBOL,
@@ -264,64 +459,54 @@ async def health() -> Dict[str, Any]:
             "interval_sec": FEEDER_INTERVAL_SEC,
         },
         "graph_jobs": list(_local_graph.keys()),
-        "gateway_public": PUBLIC_BASE,
-        "worker_base": BYBIT_WORKER_BASE,
     }
 
 
 # ─────────────────────────────────────────────
-# REALDATA ENDPOINTS
+# MARKET DATA ENDPOINTS
 # ─────────────────────────────────────────────
 
 @app.get("/live")
-async def get_live(
-    symbol: str = Query(..., description="Spot symbol, e.g. BTCUSDT"),
-    tf: str = Query("1m", description="Synthetic timeframe tag"),
+async def live(
+    symbol: str = Query(..., description="e.g. BTCUSDT"),
+    tf: str = Query("1m", description="synthetic timeframe label"),
 ):
     key = f"live:{symbol}:{tf}"
     cached = _cache_get(key)
     if cached is not None:
         return {"cached": True, **cached}
 
-    ok, ticker, status = await _bybit_worker_ticker(symbol)
+    ok, data = await _merged_live(symbol, tf)
     if not ok:
-        return JSONResponse(status_code=status, content={"proxy": APP_NAME, "error": ticker})
+        return JSONResponse(status_code=502, content={"proxy": APP_NAME, "error": data})
 
-    event = _normalize_ticker(symbol, ticker, tf)
-    _cache_put(key, event)
-    return {"cached": False, **event}
+    _cache_put(key, data)
+    return {"cached": False, **data}
+
+
+@app.get("/ohlcv")
+async def ohlcv(
+    symbol: str = Query(..., description="e.g. BTCUSDT"),
+    tf: str = Query("1h", description="1m,5m,1h,1d"),
+    limit: int = Query(100, ge=1, le=2000),
+):
+    ok, candles = await _cc_ohlcv(symbol, tf, limit)
+    if not ok:
+        return JSONResponse(status_code=502, content={"proxy": APP_NAME, "error": candles})
+    return {
+        "symbol": symbol,
+        "tf": tf,
+        "limit": limit,
+        "candles": candles,
+    }
 
 
 @app.get("/trade/top10")
-async def get_top10():
-    items: List[Dict[str, Any]] = []
-
-    for sym in TOP10:
-        ok, ticker, status = await _bybit_worker_ticker(sym)
-        if not ok:
-            # Добавляем упрощённую ошибку по символу, но не роняем весь список
-            items.append({
-                "symbol": sym,
-                "error": True,
-                "details": ticker,
-            })
-            continue
-
-        norm = _normalize_ticker(sym, ticker, tf="1m")
-        feat = norm.get("features", {})
-
-        items.append({
-            "symbol": norm.get("symbol", sym),
-            "price": norm.get("price"),
-            "change24h": feat.get("change24h"),
-            "volume": feat.get("volume24h"),
-            "high": feat.get("high24h"),
-            "low": feat.get("low24h"),
-            "bid1": feat.get("bid"),
-            "ask1": feat.get("ask"),
-        })
-
-    return {"top10": items}
+async def trade_top10():
+    ok, data = await _cc_top10()
+    if not ok:
+        return JSONResponse(status_code=502, content={"proxy": APP_NAME, "error": data})
+    return {"top10": data}
 
 
 # ─────────────────────────────────────────────
@@ -331,26 +516,22 @@ async def get_top10():
 @app.get("/graph/{job_id}")
 async def get_graph(
     job_id: str = Path(..., description="Graph job id"),
-) -> Dict[str, Any]:
+):
     g = _graph_get(job_id)
-    g_out = {"cached": True, "fallback": "local"}
-    g_out.update(g)
-    return g_out
+    out = {"cached": True, "fallback": "local"}
+    out.update(g)
+    return out
 
 
 @app.post("/ingest-pass")
-async def ingest_graph(payload: Dict[str, Any]):
-    """
-    Принимаем payload с decision_links / arena_events / mind_reflect.
-    Сохраняем в локальный _local_graph, чтобы ISKRA3 могла читать через /graph/{job_id}.
-    """
+async def ingest_pass(payload: Dict[str, Any]):
     job_id = payload.get("job_id") or "default"
     _graph_put(job_id, payload)
     return {"status": "ok", "fallback": "local"}
 
 
 # ─────────────────────────────────────────────
-# SIMPLE INDICATORS (RSI / MACD / ATR)
+# INDICATORS (RSI / MACD / ATR)
 # ─────────────────────────────────────────────
 
 def _rsi(closes: List[float], period: int = 14) -> float:
@@ -424,7 +605,7 @@ async def calc_atr(body: Dict[str, Any]):
 
 
 # ─────────────────────────────────────────────
-# RISK & RADAR (ПРОСТЫЕ ХЕЛПЕРЫ)
+# RISK & RADAR
 # ─────────────────────────────────────────────
 
 @app.post("/risk/calc")
@@ -438,9 +619,14 @@ async def risk_calc(body: Dict[str, Any]):
     var = sum((c - mean) ** 2 for c in closes_f) / len(closes_f)
     vol = var ** 0.5
 
-    if vol < 0.005 * mean:
+    if mean == 0:
+        rel_vol = 0.0
+    else:
+        rel_vol = vol / abs(mean)
+
+    if rel_vol < 0.005:
         level = "LOW"
-    elif vol < 0.02 * mean:
+    elif rel_vol < 0.02:
         level = "MEDIUM"
     else:
         level = "HIGH"
@@ -472,18 +658,16 @@ async def radar_forecast(body: Dict[str, Any]):
 
 
 # ─────────────────────────────────────────────
-# SNAPSHOT / EVENTS / GOVERNANCE — STUBS
+# SNAPSHOT / EVENTS / GOVERNANCE
 # ─────────────────────────────────────────────
 
 @app.post("/snapshot/create")
 async def create_snapshot(body: Dict[str, Any]):
-    # здесь можно сохранять state_hash/proof_hash в хранилище; пока — просто echo
     return {"status": "created"}
 
 
 @app.post("/events/route")
 async def route_event(body: Dict[str, Any]):
-    # просто echo-маршрутизатор, чтобы ISKRA3 могла писать event-stream
     return {"ok": True, "echo": body}
 
 
@@ -491,12 +675,11 @@ async def route_event(body: Dict[str, Any]):
 async def apply_policy(body: Dict[str, Any]):
     rule = body.get("rule")
     value = body.get("value")
-    # здесь можно применять свои политические правила; пока считается, что применено
     return {"applied": True, "rule": rule, "value": value}
 
 
 # ─────────────────────────────────────────────
-# FEEDER LOOP (ОПЦИОНАЛЬНО)
+# FEEDER LOOP (OPTIONAL)
 # ─────────────────────────────────────────────
 
 async def _feeder_loop():
@@ -505,9 +688,9 @@ async def _feeder_loop():
 
     while True:
         try:
-            ok, ticker, _ = await _bybit_worker_ticker(FEEDER_SYMBOL)
+            ok, data = await _merged_live(FEEDER_SYMBOL, FEEDER_TF)
             if ok:
-                # В минимальном варианте просто дергаем, чтобы не простаивал воркер.
+                # тут можно писать в graph через _graph_put или внешний ingest
                 pass
         except Exception as e:
             print("Feeder error:", e)
