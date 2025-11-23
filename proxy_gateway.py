@@ -1,15 +1,19 @@
 # ======================================================================
-# ds24-proxy-gateway v4.2 · MultiFeed Edition (Binance Proxy-Ready)
-# Binance (core) + CryptoCompare (assist), без CoinAPI
+# ds24-proxy-gateway v4.2 · MultiEndpoint Edition (Binance api/api1/api2/api3)
+# Binance (core, через 4 хоста) + CryptoCompare (fallback)
 # Готово для ISKRA3 RealFlow / DS24 stack
 #
+# Цепочка:
+#   1) https://api.binance.com
+#   2) https://api1.binance.com
+#   3) https://api2.binance.com
+#   4) https://api3.binance.com
+#   → только если все 4 дали ошибку, включается CryptoCompare.
+#
 # Особенности:
-# - Binance: основной поставщик цены, объёмов, стакана, top10.
-# - CryptoCompare: вторичный провайдер для кросс-проверки и уточнения цены.
-# - Если CC даёт адекватные данные → цена усредняется, растёт confidence.
-# - Если CC даёт аномалию → Binance остаётся единственным источником.
-# - CoinAPI убран полностью, чтобы не плодить ошибки и шум.
-# - Добавлен обход региональных ограничений Binance через BINANCE_PROXY_BASE.
+# - Каждый Binance-запрос перебирает все BINANCE_ENDPOINTS до первого успешного ответа.
+# - Если Binance недоступен по всем эндпоинтам → fallback CC для live и top10.
+# - Данные CryptoCompare используются только когда Binance полностью мёртв.
 # ======================================================================
 
 import os
@@ -30,15 +34,22 @@ APP_NAME = "ds24-proxy-gateway-v4.2"
 
 PUBLIC_BASE = os.getenv("PUBLIC_BASE", "https://ds24-crypto-forecast-1.onrender.com")
 
-# Binance (основной провайдер, без ключа)
-BINANCE_BASE = os.getenv("BINANCE_BASE", "https://api.binance.com")
-# Резервный бинанс-бэйс для обхода региональных ограничений (через прокси/воркер)
-# Если не задан, по умолчанию равен BINANCE_BASE (т.е. без прокси).
-BINANCE_PROXY_BASE = os.getenv("BINANCE_PROXY_BASE", BINANCE_BASE)
+# Binance endpoints – используем все
+# Можно переопределить через ENV: BINANCE_ENDPOINTS="https://api.binance.com,https://api1.binance.com,..."
+_default_binance_endpoints = [
+    "https://api.binance.com",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+]
+BINANCE_ENDPOINTS = [
+    e.strip()
+    for e in os.getenv("BINANCE_ENDPOINTS", ",".join(_default_binance_endpoints)).split(",")
+    if e.strip()
+]
 
 # CryptoCompare (вторичный провайдер, с ключом)
 CC_BASE = os.getenv("CC_BASE", "https://min-api.cryptocompare.com")
-# Твой ключ: можно переопределить через ENV CC_API_KEY, но по умолчанию он уже здесь
 CC_API_KEY = os.getenv("CC_API_KEY", "18421fbe-d8b5-45d9-a291-2091e39c21a4").strip()
 
 # Кеш: Balanced режим
@@ -86,7 +97,6 @@ def _graph_put(job_id: str, payload: Dict[str, Any]) -> None:
 
 app = FastAPI(title=APP_NAME)
 
-# ВАЖНО: здесь был баг. Нужно передавать класс, а не инстанс.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -151,7 +161,6 @@ async def _get_json(
             return True, {"raw": r.text}, 200
 
     except Exception as e:
-        # сетевые ошибки
         return False, {"error": str(e), "url": url, "params": params}, 502
 
 
@@ -175,64 +184,44 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
 
 
 # ============================================================
-# BINANCE HELPER (c обходом региональных ограничений)
+# BINANCE MULTI-ENDPOINT HELPER
 # ============================================================
 
-async def _binance_get(
+async def _binance_get_multi(
     path: str,
     params: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, Any, int, Dict[str, Any]]:
     """
-    Унифицированный вызов Binance с fallback на BINANCE_PROXY_BASE.
-    Сначала пробуем BINANCE_BASE. Если 451/403/502 или явная сетевая ошибка —
-    пробуем BINANCE_PROXY_BASE. Диагностика возвращается в extra.
+    Глобальный helper для Binance.
+    Перебирает BINANCE_ENDPOINTS по очереди:
+    - как только один вернул ok → возвращаем его ответ.
+    - если все упали → возвращаем последнюю ошибку.
+    diagnostics содержит по каждому endpoint статус.
     """
     diagnostics: Dict[str, Any] = {
-        "base": BINANCE_BASE,
-        "proxy_base": BINANCE_PROXY_BASE,
-        "used_proxy": False,
-        "primary_status": None,
-        "proxy_status": None,
+        "endpoints": BINANCE_ENDPOINTS,
+        "tries": [],
+        "used_endpoint": None,
     }
 
-    # 1) Пытаемся пойти на основной BINANCE_BASE
-    url_main = f"{BINANCE_BASE}{path}"
-    ok, data, status = await _get_json(url_main, params=params)
-    diagnostics["primary_status"] = status
+    last_data: Any = None
+    last_status: int = 502
 
-    # успешный ответ → возвращаем сразу
-    if ok:
-        return True, data, status, diagnostics
+    for base in BINANCE_ENDPOINTS:
+        url = f"{base}{path}"
+        ok, data, status = await _get_json(url, params=params)
+        diagnostics["tries"].append({
+            "endpoint": base,
+            "status": status,
+        })
+        if ok:
+            diagnostics["used_endpoint"] = base
+            return True, data, status, diagnostics
 
-    # Если нет успеха, проверяем, надо ли пробовать прокси
-    upstream_status = None
-    if isinstance(data, dict):
-        upstream_status = data.get("upstream_status")
+        last_data = data
+        last_status = status
 
-    # Если статус указывает на геоблок/доступ, пробуем прокси
-    try_proxy = False
-    if upstream_status in (451, 403):
-        try_proxy = True
-    elif status in (451, 403, 502):
-        try_proxy = True
-
-    # Если прокси такой же как основной — пробовать бессмысленно
-    if BINANCE_PROXY_BASE == BINANCE_BASE:
-        try_proxy = False
-
-    if try_proxy:
-        url_proxy = f"{BINANCE_PROXY_BASE}{path}"
-        ok_p, data_p, status_p = await _get_json(url_proxy, params=params)
-        diagnostics["used_proxy"] = True
-        diagnostics["proxy_status"] = status_p
-
-        if ok_p:
-            return True, data_p, status_p, diagnostics
-        # если даже прокси не помог — возвращаем ошибку прокси
-        return False, data_p, status_p, diagnostics
-
-    # если не решили пробовать прокси — возвращаем что есть
-    return False, data, status, diagnostics
+    return False, last_data, last_status, diagnostics
 
 
 # ============================================================
@@ -240,10 +229,10 @@ async def _binance_get(
 # ============================================================
 
 async def binance_24h(symbol: str) -> Tuple[bool, Optional[Dict[str, Any]], Any, Dict[str, Any]]:
-    """Основной источник цены и 24h статистики."""
+    """Основной источник цены и 24h статистики с перебором api/api1/api2/api3."""
     path = "/api/v3/ticker/24hr"
     params = {"symbol": symbol.upper()}
-    ok, data, status, diag = await _binance_get(path, params=params)
+    ok, data, status, diag = await _binance_get_multi(path, params=params)
     if not ok:
         return False, None, data, diag
 
@@ -262,10 +251,10 @@ async def binance_24h(symbol: str) -> Tuple[bool, Optional[Dict[str, Any]], Any,
 
 
 async def binance_depth(symbol: str, limit: int = DEPTH_LIMIT) -> Tuple[bool, Optional[Dict[str, Any]], Any, Dict[str, Any]]:
-    """Глубина стакана (orderbook)."""
+    """Глубина стакана (orderbook) с перебором api/api1/api2/api3."""
     path = "/api/v3/depth"
     params = {"symbol": symbol.upper(), "limit": int(limit)}
-    ok, data, status, diag = await _binance_get(path, params=params)
+    ok, data, status, diag = await _binance_get_multi(path, params=params)
     if not ok:
         return False, None, data, diag
 
@@ -278,9 +267,9 @@ async def binance_depth(symbol: str, limit: int = DEPTH_LIMIT) -> Tuple[bool, Op
 
 
 async def binance_top10() -> Tuple[bool, Optional[List[Dict[str, Any]]], Any, Dict[str, Any]]:
-    """Топ-10 по нашему списку через Binance 24hr tickers."""
+    """Топ-10 по нашему списку через Binance 24hr tickers с перебором api/api1/api2/api3."""
     path = "/api/v3/ticker/24hr"
-    ok, data, status, diag = await _binance_get(path)
+    ok, data, status, diag = await _binance_get_multi(path)
     if not ok:
         return False, None, data, diag
 
@@ -290,7 +279,6 @@ async def binance_top10() -> Tuple[bool, Optional[List[Dict[str, Any]]], Any, Di
             sym = str(item.get("symbol", "")).upper()
             if sym not in TOP10:
                 continue
-
             out.append({
                 "symbol": sym,
                 "price": _safe_float(item.get("lastPrice", 0.0)),
@@ -301,7 +289,6 @@ async def binance_top10() -> Tuple[bool, Optional[List[Dict[str, Any]]], Any, Di
                 "bid1": _safe_float(item.get("bidPrice", 0.0)),
                 "ask1": _safe_float(item.get("askPrice", 0.0)),
             })
-
         out_sorted = sorted(out, key=lambda x: TOP10.index(x["symbol"]))
         return True, out_sorted[:10], data, diag
     except Exception as e:
@@ -319,10 +306,7 @@ def _cc_headers() -> Dict[str, str]:
 
 
 async def cc_live(symbol: str) -> Tuple[bool, Optional[Dict[str, Any]], Any]:
-    """
-    CryptoCompare live data (2nd provider).
-    Требует CC_API_KEY. Без ключа — мягкий отказ, не ломающий unified_live.
-    """
+    """CryptoCompare live (полный fallback, если Binance умер везде)."""
     if not CC_API_KEY:
         return False, None, {"error": "no_cc_key", "hint": "set CC_API_KEY to enable CryptoCompare"}
 
@@ -348,8 +332,39 @@ async def cc_live(symbol: str) -> Tuple[bool, Optional[Dict[str, Any]], Any]:
         return False, None, {"error": "cc_parse", "details": str(e), "raw": data}
 
 
+async def cc_top10() -> Tuple[bool, Optional[List[Dict[str, Any]]], Any]:
+    """Простейший fallback top10 через CryptoCompare, если Binance полностью мёртв."""
+    if not CC_API_KEY:
+        return False, None, {"error": "no_cc_key_top10"}
+
+    # CC умеет мультисимвольный запрос, но для надёжности можно идти по одному
+    out: List[Dict[str, Any]] = []
+    raw_all: Dict[str, Any] = {"symbols": {}}
+
+    for sym in TOP10:
+        ok, data, raw = await cc_live(sym)
+        raw_all["symbols"][sym] = raw
+        if not ok or not data:
+            continue
+        out.append({
+            "symbol": sym,
+            "price": data["price"],
+            "change24h": data.get("change24h", 0.0),
+            "volume": data.get("volume24h", 0.0),
+            "high": data.get("high24h", 0.0),
+            "low": data.get("low24h", 0.0),
+            "bid1": data.get("bid", 0.0),
+            "ask1": data.get("ask", 0.0),
+        })
+
+    if not out:
+        return False, None, raw_all
+
+    return True, out, raw_all
+
+
 # ============================================================
-# UNIFIED LAYER (Hybrid Pro: Binance-Core + CC-Assist)
+# UNIFIED LAYER (Binance multi-endpoint + CC fallback)
 # ============================================================
 
 def _approx_rsi(price: Optional[float], low: Optional[float], high: Optional[float]) -> float:
@@ -361,22 +376,23 @@ def _approx_rsi(price: Optional[float], low: Optional[float], high: Optional[flo
 
 
 async def unified_live(symbol: str, tf: str) -> Tuple[bool, Dict[str, Any], int]:
-    # 1) Binance как ядро (через helper с прокси-обходом)
+    # 1) Binance через все эндпоинты
     bn_ok, bn_data, bn_raw, bn_diag = await binance_24h(symbol)
     depth_ok, depth_data, depth_raw, depth_diag = await binance_depth(symbol, DEPTH_LIMIT)
 
-    # 2) CryptoCompare как ассистент
+    # 2) CryptoCompare fallback: только если Binance полностью мёртв
     cc_ok = cc_data = cc_raw = None
-    if CC_API_KEY:
+    if not bn_ok:
         cc_ok, cc_data, cc_raw = await cc_live(symbol)
 
+    # если оба умерли — жёсткий фейл
     if not bn_ok and not cc_ok:
         return False, {
             "proxy": APP_NAME,
             "error": "no_provider_ok",
-            "binance": bn_raw,
+            "binance_raw": bn_raw,
             "binance_diag": bn_diag,
-            "cryptocompare": cc_raw,
+            "cryptocompare_raw": cc_raw,
         }, 502
 
     providers_used: List[str] = []
@@ -387,10 +403,8 @@ async def unified_live(symbol: str, tf: str) -> Tuple[bool, Dict[str, Any], int]
         "binance_depth_diag": depth_diag,
         "cc_ok": cc_ok,
         "cc_used": False,
-        "cc_delta_pct": None,
     }
 
-    # базовая цена и фичи — из Binance, если доступен
     price: Optional[float] = None
     features = {
         "change24h": None,
@@ -401,6 +415,7 @@ async def unified_live(symbol: str, tf: str) -> Tuple[bool, Dict[str, Any], int]
         "ask": None,
     }
 
+    # приоритет: Binance → если жив
     if bn_ok and bn_data:
         providers_used.append("binance")
         price = bn_data["price"]
@@ -411,8 +426,8 @@ async def unified_live(symbol: str, tf: str) -> Tuple[bool, Dict[str, Any], int]
         features["bid"] = bn_data["bid"]
         features["ask"] = bn_data["ask"]
     elif cc_ok and cc_data:
-        # если Binance отвалился — fallback на CC
         providers_used.append("cryptocompare")
+        diagnostics["cc_used"] = True
         price = cc_data["price"]
         features["change24h"] = cc_data.get("change24h")
         features["volume24h"] = cc_data.get("volume24h")
@@ -421,37 +436,13 @@ async def unified_live(symbol: str, tf: str) -> Tuple[bool, Dict[str, Any], int]
         features["bid"] = cc_data.get("bid")
         features["ask"] = cc_data.get("ask")
 
-    # Hybrid Pro логика: если оба живы — проверяем расхождение
-    confidence = 0.7  # базовое
-    if bn_ok and bn_data and cc_ok and cc_data and price is not None:
-        cc_price = cc_data["price"]
-        if cc_price is not None and cc_price > 0 and price > 0:
-            delta = abs(cc_price - price) / price
-            diagnostics["cc_delta_pct"] = delta
-
-            if delta < 0.01:
-                # почти идентичные цены → усреднение + высокий confidence
-                price = (price + cc_price) / 2.0
-                providers_used.append("cryptocompare")
-                diagnostics["cc_used"] = True
-                confidence = 0.96
-            elif delta < 0.03:
-                # умеренное расхождение → осторожное усреднение + средний confidence
-                price = (price * 0.7 + cc_price * 0.3)
-                providers_used.append("cryptocompare")
-                diagnostics["cc_used"] = True
-                confidence = 0.85
-            else:
-                # сильное расхождение → игнорируем CC, остаёмся на Binance
-                diagnostics["cc_used"] = False
-                confidence = 0.75
-        else:
-            diagnostics["cc_delta_pct"] = None
-
-    elif bn_ok and bn_data:
-        confidence = 0.9
-    elif cc_ok and cc_data:
-        confidence = 0.8
+    # простая оценка доверия
+    if bn_ok:
+        q_score = 0.9
+    elif cc_ok:
+        q_score = 0.8
+    else:
+        q_score = 0.5
 
     rsi_approx = _approx_rsi(price, features["low24h"], features["high24h"])
     vol_index = None
@@ -468,9 +459,9 @@ async def unified_live(symbol: str, tf: str) -> Tuple[bool, Dict[str, Any], int]
             "rsi_approx": rsi_approx,
             "volatility_index": vol_index,
         },
-        "forecast": {},  # сюда можно писать ISKRA-прогнозы
+        "forecast": {},
         "source": "+".join(sorted(set(providers_used))) if providers_used else "unknown",
-        "q_score": confidence,
+        "q_score": q_score,
         "diagnostics": diagnostics,
     }
 
@@ -486,16 +477,30 @@ async def unified_live(symbol: str, tf: str) -> Tuple[bool, Dict[str, Any], int]
 
 
 async def unified_top10() -> Tuple[bool, Dict[str, Any], int]:
-    # Топ-10 оставляем чисто на Binance — он надёжный и быстрый (через прокси-хелпер)
+    # 1) Binance через все endpoints
     bn_ok, bn_list, bn_raw, bn_diag = await binance_top10()
     if bn_ok and bn_list:
-        return True, {"provider": "binance", "top10": bn_list, "diagnostics": {"binance": bn_diag}}, 200
+        return True, {
+            "provider": "binance",
+            "top10": bn_list,
+            "diagnostics": {"binance": bn_diag},
+        }, 200
+
+    # 2) fallback: CryptoCompare, только если Binance полностью умер
+    cc_ok, cc_list, cc_raw = await cc_top10()
+    if cc_ok and cc_list:
+        return True, {
+            "provider": "cryptocompare",
+            "top10": cc_list,
+            "diagnostics": {"cryptocompare": cc_raw},
+        }, 200
 
     return False, {
         "proxy": APP_NAME,
         "error": "top10_failed",
-        "binance": bn_raw,
+        "binance_raw": bn_raw,
         "binance_diag": bn_diag,
+        "cc_raw": cc_raw,
     }, 502
 
 
@@ -589,14 +594,10 @@ async def health():
         "ts": int(time.time()),
         "providers": {
             "binance": {
-                "enabled": True,
-                "base": BINANCE_BASE,
-                "proxy_base": BINANCE_PROXY_BASE,
+                "endpoints": BINANCE_ENDPOINTS,
             },
             "cryptocompare": {
                 "enabled": bool(CC_API_KEY),
-                "requires_key": True,
-                "has_key": bool(CC_API_KEY),
                 "base": CC_BASE,
             },
         },
