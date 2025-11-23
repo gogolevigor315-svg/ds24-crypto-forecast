@@ -1,5 +1,15 @@
-# ds24-proxy-gateway v3.2 (Binance + CryptoCompare + CoinAPI, with orderbook depth)
-# Balanced mode, готово для ISKRA3 RealFlow
+# ======================================================================
+# ds24-proxy-gateway v4.0 · MultiFeed Edition
+# Binance (core) + CryptoCompare (assist), без CoinAPI
+# Готово для ISKRA3 RealFlow / DS24 stack
+#
+# Особенности:
+# - Binance: основной поставщик цены, объёмов, стакана, top10.
+# - CryptoCompare: вторичный провайдер для кросс-проверки и уточнения цены.
+# - Если CC даёт адекватные данные → цена усредняется, растёт confidence.
+# - Если CC даёт аномалию → Binance остаётся единственным источником.
+# - CoinAPI убран полностью, чтобы не плодить ошибки и шум.
+# ======================================================================
 
 import os
 import time
@@ -11,7 +21,7 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-APP_NAME = "ds24-proxy-gateway"
+APP_NAME = "ds24-proxy-gateway-v4"
 
 # ============================================================
 # CONFIG
@@ -22,13 +32,10 @@ PUBLIC_BASE = os.getenv("PUBLIC_BASE", "https://ds24-crypto-forecast-1.onrender.
 # Binance (основной провайдер, без ключа)
 BINANCE_BASE = os.getenv("BINANCE_BASE", "https://api.binance.com")
 
-# CryptoCompare (опционально, по ключу)
+# CryptoCompare (вторичный провайдер, с ключом)
 CC_BASE = os.getenv("CC_BASE", "https://min-api.cryptocompare.com")
-CC_API_KEY = os.getenv("CC_API_KEY", "")
-
-# CoinAPI (опционально, по ключу)
-COINAPI_BASE = os.getenv("COINAPI_BASE", "https://rest.coinapi.io")
-COINAPI_KEY = os.getenv("COINAPI_KEY", "")
+# Твой ключ: можно переопределить через ENV CC_API_KEY, но по умолчанию он уже здесь
+CC_API_KEY = os.getenv("CC_API_KEY", "18421fbe-d8b5-45d9-a291-2091e39c21a4").strip()
 
 # Кеш: Balanced режим
 CACHE_TTL = int(os.getenv("CACHE_TTL", "3"))           # live-данные
@@ -37,7 +44,7 @@ DEPTH_LIMIT = int(os.getenv("DEPTH_LIMIT", "10"))      # уровни стака
 
 TOP10 = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT",
-    "DOGEUSDT", "TONUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT"
+    "DOGEUSDT", "TONUSDT", "ADAUSDT", "AVAXUSDT", "LINKUSDT",
 ]
 
 # ============================================================
@@ -48,16 +55,19 @@ _local_graph: Dict[str, Dict[str, Any]] = {}
 
 
 def _graph_get(job_id: str) -> Dict[str, Any]:
-    return _local_graph.get(job_id, {
-        "nodes": [],
-        "edges": [],
-        "metrics": {
-            "dqi_avg": None,
-            "risk_cvar": None,
-            "finops_cost_usd": None,
-            "updated_at": None,
+    return _local_graph.get(
+        job_id,
+        {
+            "nodes": [],
+            "edges": [],
+            "metrics": {
+                "dqi_avg": None,
+                "risk_cvar": None,
+                "finops_cost_usd": None,
+                "updated_at": None,
+            },
         },
-    })
+    )
 
 
 def _graph_put(job_id: str, payload: Dict[str, Any]) -> None:
@@ -103,7 +113,7 @@ def _cache_put(key: str, data: Any, ttl: int) -> None:
 
 
 # ============================================================
-# HTTP HELPER
+# HELPERS
 # ============================================================
 
 async def _get_json(
@@ -151,6 +161,13 @@ def _split_symbol(symbol: str) -> Tuple[str, str]:
     return symbol, "USDT"
 
 
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
 # ============================================================
 # PROVIDERS: BINANCE
 # ============================================================
@@ -165,13 +182,13 @@ async def binance_24h(symbol: str) -> Tuple[bool, Optional[Dict[str, Any]], Any]
 
     try:
         return True, {
-            "price": float(data.get("lastPrice", 0.0)),
-            "change24h": float(data.get("priceChangePercent", 0.0)) / 100.0,
-            "volume24h": float(data.get("quoteVolume", 0.0)),
-            "high24h": float(data.get("highPrice", 0.0)),
-            "low24h": float(data.get("lowPrice", 0.0)),
-            "bid": float(data.get("bidPrice", 0.0)),
-            "ask": float(data.get("askPrice", 0.0)),
+            "price": _safe_float(data.get("lastPrice", 0.0)),
+            "change24h": _safe_float(data.get("priceChangePercent", 0.0)) / 100.0,
+            "volume24h": _safe_float(data.get("quoteVolume", 0.0)),
+            "high24h": _safe_float(data.get("highPrice", 0.0)),
+            "low24h": _safe_float(data.get("lowPrice", 0.0)),
+            "bid": _safe_float(data.get("bidPrice", 0.0)),
+            "ask": _safe_float(data.get("askPrice", 0.0)),
         }, data
     except Exception as e:
         return False, None, {"error": "binance_parse", "details": str(e), "raw": data}
@@ -186,8 +203,8 @@ async def binance_depth(symbol: str, limit: int = DEPTH_LIMIT) -> Tuple[bool, Op
         return False, None, data
 
     try:
-        bids = [[float(p), float(q)] for p, q in data.get("bids", [])]
-        asks = [[float(p), float(q)] for p, q in data.get("asks", [])]
+        bids = [[_safe_float(p), _safe_float(q)] for p, q in data.get("bids", [])]
+        asks = [[_safe_float(p), _safe_float(q)] for p, q in data.get("asks", [])]
         return True, {"bids": bids, "asks": asks}, data
     except Exception as e:
         return False, None, {"error": "depth_parse", "details": str(e), "raw": data}
@@ -209,13 +226,13 @@ async def binance_top10() -> Tuple[bool, Optional[List[Dict[str, Any]]], Any]:
 
             out.append({
                 "symbol": sym,
-                "price": float(item.get("lastPrice", 0.0)),
-                "change24h": float(item.get("priceChangePercent", 0.0)) / 100.0,
-                "volume": float(item.get("quoteVolume", 0.0)),
-                "high": float(item.get("highPrice", 0.0)),
-                "low": float(item.get("lowPrice", 0.0)),
-                "bid1": float(item.get("bidPrice", 0.0)),
-                "ask1": float(item.get("askPrice", 0.0)),
+                "price": _safe_float(item.get("lastPrice", 0.0)),
+                "change24h": _safe_float(item.get("priceChangePercent", 0.0)) / 100.0,
+                "volume": _safe_float(item.get("quoteVolume", 0.0)),
+                "high": _safe_float(item.get("highPrice", 0.0)),
+                "low": _safe_float(item.get("lowPrice", 0.0)),
+                "bid1": _safe_float(item.get("bidPrice", 0.0)),
+                "ask1": _safe_float(item.get("askPrice", 0.0)),
             })
 
         out_sorted = sorted(out, key=lambda x: TOP10.index(x["symbol"]))
@@ -225,16 +242,22 @@ async def binance_top10() -> Tuple[bool, Optional[List[Dict[str, Any]]], Any]:
 
 
 # ============================================================
-# PROVIDERS: CRYPTOCOMPARE (OPTIONAL)
+# PROVIDER: CRYPTOCOMPARE
 # ============================================================
 
 def _cc_headers() -> Dict[str, str]:
-    return {"authorization": f"Apikey {CC_API_KEY}"} if CC_API_KEY else {}
+    if CC_API_KEY:
+        return {"authorization": f"Apikey {CC_API_KEY}"}
+    return {}
 
 
 async def cc_live(symbol: str) -> Tuple[bool, Optional[Dict[str, Any]], Any]:
+    """
+    CryptoCompare live data (2nd provider).
+    Требует CC_API_KEY. Без ключа — мягкий отказ, не ломающий unified_live.
+    """
     if not CC_API_KEY:
-        return False, None, {"error": "no_cc_key"}
+        return False, None, {"error": "no_cc_key", "hint": "set CC_API_KEY to enable CryptoCompare"}
 
     base, quote = _split_symbol(symbol)
     url = f"{CC_BASE}/data/pricemultifull"
@@ -246,44 +269,20 @@ async def cc_live(symbol: str) -> Tuple[bool, Optional[Dict[str, Any]], Any]:
     try:
         raw = data["RAW"][base][quote]
         return True, {
-            "price": float(raw.get("PRICE", 0.0)),
-            "change24h": float(raw.get("CHANGEPCT24HOUR", 0.0)) / 100.0,
-            "volume24h": float(raw.get("TOTALVOLUME24H", 0.0)),
-            "high24h": float(raw.get("HIGH24HOUR", 0.0)),
-            "low24h": float(raw.get("LOW24HOUR", 0.0)),
-            "bid": float(raw.get("BID", 0.0)),
-            "ask": float(raw.get("ASK", 0.0)),
+            "price": _safe_float(raw.get("PRICE", 0.0)),
+            "change24h": _safe_float(raw.get("CHANGEPCT24HOUR", 0.0)) / 100.0,
+            "volume24h": _safe_float(raw.get("TOTALVOLUME24H", 0.0)),
+            "high24h": _safe_float(raw.get("HIGH24HOUR", 0.0)),
+            "low24h": _safe_float(raw.get("LOW24HOUR", 0.0)),
+            "bid": _safe_float(raw.get("BID", 0.0)),
+            "ask": _safe_float(raw.get("ASK", 0.0)),
         }, data
     except Exception as e:
         return False, None, {"error": "cc_parse", "details": str(e), "raw": data}
 
 
 # ============================================================
-# PROVIDERS: COINAPI (OPTIONAL)
-# ============================================================
-
-def _coinapi_headers() -> Dict[str, str]:
-    return {"X-CoinAPI-Key": COINAPI_KEY} if COINAPI_KEY else {}
-
-
-async def coinapi_live(symbol: str) -> Tuple[bool, Optional[Dict[str, Any]], Any]:
-    if not COINAPI_KEY:
-        return False, None, {"error": "no_coinapi_key"}
-
-    base, quote = _split_symbol(symbol)
-    url = f"{COINAPI_BASE}/v1/exchangerate/{base}/{quote}"
-    ok, data, status = await _get_json(url, headers=_coinapi_headers())
-    if not ok:
-        return False, None, data
-
-    try:
-        return True, {"price": float(data.get("rate", 0.0))}, data
-    except Exception as e:
-        return False, None, {"error": "coinapi_parse", "details": str(e), "raw": data}
-
-
-# ============================================================
-# UNIFIED LAYER (BALANCED + DEPTH)
+# UNIFIED LAYER (Hybrid Pro: Binance-Core + CC-Assist)
 # ============================================================
 
 def _approx_rsi(price: Optional[float], low: Optional[float], high: Optional[float]) -> float:
@@ -295,29 +294,33 @@ def _approx_rsi(price: Optional[float], low: Optional[float], high: Optional[flo
 
 
 async def unified_live(symbol: str, tf: str) -> Tuple[bool, Dict[str, Any], int]:
-    # Binance всегда пробуем первым
+    # 1) Binance как ядро
     bn_ok, bn_data, bn_raw = await binance_24h(symbol)
     depth_ok, depth_data, depth_raw = await binance_depth(symbol, DEPTH_LIMIT)
 
-    # Опциональные провайдеры — только если есть ключи
+    # 2) CryptoCompare как ассистент
     cc_ok = cc_data = cc_raw = None
-    ca_ok = ca_data = ca_raw = None
-
     if CC_API_KEY:
         cc_ok, cc_data, cc_raw = await cc_live(symbol)
-    if COINAPI_KEY:
-        ca_ok, ca_data, ca_raw = await coinapi_live(symbol)
 
-    if not bn_ok and not (cc_ok or ca_ok):
+    if not bn_ok and not cc_ok:
         return False, {
             "proxy": APP_NAME,
             "error": "no_provider_ok",
             "binance": bn_raw,
             "cryptocompare": cc_raw,
-            "coinapi": ca_raw,
         }, 502
 
-    price = None
+    providers_used: List[str] = []
+    diagnostics: Dict[str, Any] = {
+        "binance_ok": bn_ok,
+        "cc_ok": cc_ok,
+        "cc_used": False,
+        "cc_delta_pct": None,
+    }
+
+    # базовая цена и фичи — из Binance, если доступен
+    price: Optional[float] = None
     features = {
         "change24h": None,
         "volume24h": None,
@@ -326,9 +329,7 @@ async def unified_live(symbol: str, tf: str) -> Tuple[bool, Dict[str, Any], int]
         "bid": None,
         "ask": None,
     }
-    providers_used: List[str] = []
 
-    # 1) Binance как базовый
     if bn_ok and bn_data:
         providers_used.append("binance")
         price = bn_data["price"]
@@ -338,21 +339,53 @@ async def unified_live(symbol: str, tf: str) -> Tuple[bool, Dict[str, Any], int]
         features["low24h"] = bn_data["low24h"]
         features["bid"] = bn_data["bid"]
         features["ask"] = bn_data["ask"]
-
-    # 2) CryptoCompare — уточнение и кросс-проверка
-    if cc_ok and cc_data:
+    elif cc_ok and cc_data:
+        # если Binance отвалился — fallback на CC
         providers_used.append("cryptocompare")
-        if price is not None and cc_data["price"] is not None:
-            price = (price + cc_data["price"]) / 2.0
+        price = cc_data["price"]
+        features["change24h"] = cc_data.get("change24h")
+        features["volume24h"] = cc_data.get("volume24h")
+        features["high24h"] = cc_data.get("high24h")
+        features["low24h"] = cc_data.get("low24h")
+        features["bid"] = cc_data.get("bid")
+        features["ask"] = cc_data.get("ask")
 
-    # 3) CoinAPI — если есть, только sanity-check цены
-    if ca_ok and ca_data:
-        providers_used.append("coinapi")
-        if price is not None and ca_data["price"] is not None:
-            price = (price + ca_data["price"]) / 2.0
+    # Hybrid Pro логика: если оба живы — проверяем расхождение
+    confidence = 0.7  # базовое
+    if bn_ok and bn_data and cc_ok and cc_data and price is not None:
+        cc_price = cc_data["price"]
+        if cc_price is not None and cc_price > 0 and price > 0:
+            delta = abs(cc_price - price) / price
+            diagnostics["cc_delta_pct"] = delta
+
+            if delta < 0.01:
+                # почти идентичные цены → усреднение + высокий confidence
+                price = (price + cc_price) / 2.0
+                providers_used.append("cryptocompare")
+                diagnostics["cc_used"] = True
+                confidence = 0.96
+            elif delta < 0.03:
+                # умеренное расхождение → осторожное усреднение + средний confidence
+                price = (price * 0.7 + cc_price * 0.3)
+                providers_used.append("cryptocompare")
+                diagnostics["cc_used"] = True
+                confidence = 0.85
+            else:
+                # сильное расхождение → игнорируем CC, остаёмся на Binance
+                diagnostics["cc_used"] = False
+                confidence = 0.75
+        else:
+            diagnostics["cc_delta_pct"] = None
+
+    elif bn_ok and bn_data:
+        confidence = 0.9
+    elif cc_ok and cc_data:
+        confidence = 0.8
 
     rsi_approx = _approx_rsi(price, features["low24h"], features["high24h"])
-    vol_index = min(1.0, abs(features["change24h"] or 0.0) / 0.10)
+    vol_index = None
+    if features["change24h"] is not None:
+        vol_index = min(1.0, abs(features["change24h"]) / 0.10)
 
     event: Dict[str, Any] = {
         "ts": _now_iso(),
@@ -364,9 +397,10 @@ async def unified_live(symbol: str, tf: str) -> Tuple[bool, Dict[str, Any], int]
             "rsi_approx": rsi_approx,
             "volatility_index": vol_index,
         },
-        "forecast": {},
-        "source": "+".join(providers_used) if providers_used else "unknown",
-        "q_score": None,
+        "forecast": {},          # сюда можно писать ISKRA-прогнозы
+        "source": "+".join(sorted(set(providers_used))) if providers_used else "unknown",
+        "q_score": confidence,
+        "diagnostics": diagnostics,
     }
 
     if depth_ok and depth_data:
@@ -381,23 +415,14 @@ async def unified_live(symbol: str, tf: str) -> Tuple[bool, Dict[str, Any], int]
 
 
 async def unified_top10() -> Tuple[bool, Dict[str, Any], int]:
-    # Сначала пробуем Binance
+    # Топ-10 оставляем чисто на Binance — он надёжный и быстрый
     bn_ok, bn_list, bn_raw = await binance_top10()
     if bn_ok and bn_list:
         return True, {"provider": "binance", "top10": bn_list}, 200
 
-    # Фоллбек на CryptoCompare при наличии ключа
-    if CC_API_KEY:
-        # Можно переиспользовать старую логику, но если CC закрыт — не ломаемся
-        return False, {
-            "proxy": APP_NAME,
-            "error": "top10_failed",
-            "binance": bn_raw,
-        }, 502
-
     return False, {
         "proxy": APP_NAME,
-        "error": "top10_failed_no_provider",
+        "error": "top10_failed",
         "binance": bn_raw,
     }, 502
 
@@ -486,9 +511,16 @@ async def health():
         "app": APP_NAME,
         "ts": int(time.time()),
         "providers": {
-            "binance": True,
-            "cryptocompare": bool(CC_API_KEY),
-            "coinapi": bool(COINAPI_KEY),
+            "binance": {
+                "enabled": True,
+                "base": BINANCE_BASE,
+            },
+            "cryptocompare": {
+                "enabled": bool(CC_API_KEY),
+                "requires_key": True,
+                "has_key": bool(CC_API_KEY),
+                "base": CC_BASE,
+            },
         },
         "graph_jobs": list(_local_graph.keys()),
         "public_base": PUBLIC_BASE,
@@ -589,5 +621,5 @@ async def governance_policy(body: Dict[str, Any]):
 
 @app.on_event("startup")
 async def _startup():
-    # тут можно будет подвесить фонового фидера, если понадобится
+    # сюда при желании можно повесить фонового фидера
     pass
