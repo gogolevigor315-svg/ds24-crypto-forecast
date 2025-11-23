@@ -1,5 +1,5 @@
 # ======================================================================
-# ds24-proxy-gateway v4.1 · MultiFeed Edition (Binance Proxy-Ready)
+# ds24-proxy-gateway v4.2 · MultiFeed Edition (Binance Proxy-Ready)
 # Binance (core) + CryptoCompare (assist), без CoinAPI
 # Готово для ISKRA3 RealFlow / DS24 stack
 #
@@ -22,7 +22,7 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-APP_NAME = "ds24-proxy-gateway-v4.1"
+APP_NAME = "ds24-proxy-gateway-v4.2"
 
 # ============================================================
 # CONFIG
@@ -86,13 +86,13 @@ def _graph_put(job_id: str, payload: Dict[str, Any]) -> None:
 
 app = FastAPI(title=APP_NAME)
 
+# ВАЖНО: здесь был баг. Нужно передавать класс, а не инстанс.
 app.add_middleware(
-    CORSMiddleware(
-        allow_origins=["*"],
-        allow_credentials=False,
-        allow_methods=["GET", "POST"],
-        allow_headers=["*"],
-    )
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ============================================================
@@ -578,7 +578,7 @@ def _radar(closes: List[float]) -> Tuple[str, float]:
 
 @app.get("/")
 async def root():
-    return {"ok": True, "app": APP_NAME, "msg": "DS24 ISKRA3 Gateway v4.1 running"}
+    return {"ok": True, "app": APP_NAME, "msg": "DS24 ISKRA3 Gateway v4.2 running"}
 
 
 @app.get("/health")
